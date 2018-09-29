@@ -1,0 +1,17 @@
+[package]
+name = "rustlsm"
+version = "0.1.0"
+authors = ["Stuart Glaser <stuglaser@gmail.com>"]
+
+[dependencies]
+nom = "^4.0"
+tempfile = "3.0"
+byteorder = "1.2"
+rand = "0.5"
+
+[dev-dependencies]
+criterion = "0.2"
+
+[[bench]]
+name = "sstable_bench"
+harness = false
