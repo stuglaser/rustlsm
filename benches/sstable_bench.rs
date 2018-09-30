@@ -8,7 +8,7 @@ extern crate tempfile;
 use tempfile::NamedTempFile;
 
 extern crate rustlsm;
-use rustlsm::lsm::{SSTable, SSTableBuilder};
+use rustlsm::{SSTable, SSTableBuilder};
 
 // Borrowed from seed_from_u64, which will be in rand 0.5
 fn make_seeded_rng<T: SeedableRng>(mut state: u64) -> T {
@@ -62,7 +62,8 @@ fn criterion_benchmark(c: &mut Criterion) {
     for k in &keys {
         builder.add(k, &format!("xx_{}", k)).unwrap();
     }
-    builder.finish();
+    builder.finish().unwrap();
+    drop(builder);
 
     let mut sstable = SSTable::open(file.path());
     let n = (keys.len() as f32 * 0.9) as usize;

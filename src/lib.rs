@@ -4,14 +4,13 @@ extern crate tempfile;
 extern crate byteorder;
 extern crate rand;
 
-pub mod lsm {
-
 use std::collections::BTreeMap;
+use std::collections::HashMap;
 use std::path::Path;
 use std::path::PathBuf;
 use std::io;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Write, Seek, SeekFrom};
 use std::io::ErrorKind::UnexpectedEof;
 use std::cmp::max;
 use std::str;
@@ -19,16 +18,21 @@ use std::marker::PhantomData;
 
 use byteorder::*;
 
+use byteorder::LittleEndian as Endian;
 
+
+const SSTABLE_SIGNATURE : &'static str = "SSTB";
 
 pub struct SSTable {
-    path: PathBuf
+    path: PathBuf,
+    size: u64,
+    index: HashMap<String, u64>,
 }
 
 pub struct SSTableIter<'a> {
     file: fs::File,
-    done: bool,
-    phantom: PhantomData<&'a SSTable>,
+    sstable: &'a SSTable,
+    loc: u64,
 }
 
 // Reads everything but keylen from the record. This is kind of silly, it just
@@ -36,7 +40,7 @@ pub struct SSTableIter<'a> {
 // the first thing we read from the record.
 fn read_rest_of_record(file: &mut fs::File, keylen: usize)
                        -> Result<(String, String), io::Error> {
-    let valuelen = file.read_u32::<LittleEndian>()? as usize;
+    let valuelen = file.read_u32::<Endian>()? as usize;
 
     let mut keybuf = vec![0 as u8; keylen];
     file.read_exact(&mut keybuf)?;
@@ -51,7 +55,7 @@ fn read_rest_of_record(file: &mut fs::File, keylen: usize)
 
 // Reads a record.  Returns None on EOF
 fn read_record(file: &mut fs::File) -> Option<Result<(String, String), io::Error>> {
-    let keylen = match file.read_u32::<LittleEndian>() {
+    let keylen = match file.read_u32::<Endian>() {
         Ok(len) => len as usize,
         Err(err) => {
             if err.kind() == UnexpectedEof {
@@ -68,73 +72,161 @@ fn write_record(file: &mut fs::File, key: &str, value: &str)
                 -> Result<(), io::Error> {
     let keybytes = key.as_bytes();
     let valuebytes = value.as_bytes();
-    file.write_u32::<LittleEndian>(keybytes.len() as u32)?;
-    file.write_u32::<LittleEndian>(valuebytes.len() as u32)?;
+    file.write_u32::<Endian>(keybytes.len() as u32)?;
+    file.write_u32::<Endian>(valuebytes.len() as u32)?;
     file.write_all(keybytes)?;
     file.write_all(valuebytes)?;
     Ok(())
+}
+
+impl<'a> SSTableIter<'a> {
+    pub fn done(&self) -> bool {
+        self.loc >= self.sstable.size
+    }
 }
 
 impl<'a> Iterator for SSTableIter<'a> {
     type Item = Result<(String, String), io::Error>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.done {
+        if self.done() {
             return None
         }
 
+        self.loc += 1;
         match read_record(&mut self.file) {
             None => {
-                self.done = true;
-                None
+                //self.done = true;
+                //None
+                panic!("I don't think this should happen anymore");
             },
             Some(Ok(x)) => Some(Ok(x)),
             Some(Err(err)) => {
-                self.done = true;
+                //self.done = true;
+                self.loc = self.sstable.size;
                 Some(Err(err))
             }
         }
     }
 }
 
+impl<'a> ExactSizeIterator for SSTableIter<'a> {}
+
 impl SSTable {
     pub fn open(path: &Path) -> SSTable {
-        SSTable{ path: path.to_path_buf() }
+        let mut sstable = SSTable{ path: path.to_path_buf(),
+                                   size: 0,
+                                   index: HashMap::new() };
+        sstable.preload().unwrap();
+        sstable
+    }
+
+    fn preload(&mut self) -> Result<(), io::Error> {
+        let mut file = fs::File::open(&self.path)?;
+
+        // Reads the footer
+        file.seek(SeekFrom::End(-20))?;
+        let footer_loc = file.seek(SeekFrom::Current(0))?;
+        println!("Reading footer from {}", footer_loc);
+
+        // Reads the signature
+        let mut signature = [0; 4];
+        file.read_exact(&mut signature)?;
+        if signature != SSTABLE_SIGNATURE.as_bytes() {
+            panic!("Invalid sstable signature: {:?}", signature);
+        }
+
+        self.size = file.read_u64::<Endian>()?;
+        let index_offset = file.read_u64::<Endian>()?;
+
+        // Reads the index
+        file.seek(SeekFrom::Start(index_offset))?;
+        for _ in 0..self.size {
+            let keylen = file.read_u32::<Endian>()? as usize;
+            let mut keybuf = vec![0 as u8; keylen];
+            file.read_exact(&mut keybuf)?;
+            let key = String::from_utf8(keybuf).unwrap();
+
+            let offset = file.read_u64::<Endian>()?;
+            self.index.insert(key, offset);
+        }
+
+        Ok(())
     }
 
     pub fn iter<'a>(&'a mut self) -> SSTableIter {
         let mut file = fs::File::open(&self.path).unwrap();
-        SSTableIter::<'a>{file: file, done: false, phantom: PhantomData}
+        SSTableIter::<'a>{file: file,
+                          sstable: self,
+                          loc: 0}
     }
 
     pub fn get(&mut self, key: &str) -> Result<Option<String>, io::Error> {
-        // TODO: linear search for now
-        for record in self.iter() {
-            let (k, v) = record?;
-            if k == key {
-                return Ok(Some(v));
-            }
-        }
+        let loc = match self.index.get(key) {
+            Some(loc) => *loc,
+            None => return Ok(None),
+        };
 
-        Ok(None)
+        let mut file = fs::File::open(&self.path)?;
+        file.seek(SeekFrom::Start(loc));
+        let (key, value) = read_record(&mut file).unwrap()?;
+        Ok(Some(value))
+    }
+
+    pub fn len(&mut self) -> usize {
+        self.size as usize
     }
 }
 
 pub struct SSTableBuilder {
     file: fs::File,
+    index: Vec<(String, u64)>,
+    finished: bool,
 }
 
 impl SSTableBuilder {
     pub fn create(path: &Path) -> Result<SSTableBuilder, io::Error> {
-        Ok(SSTableBuilder{ file: fs::File::create(path)? })
+        Ok(SSTableBuilder{
+            file: fs::File::create(path)?,
+            index: Vec::new(),
+            finished: false})
     }
 
     pub fn add(&mut self, key: &str, value: &str) -> Result<(), io::Error> {
+        assert!(!self.finished);
+        let loc = self.file.seek(SeekFrom::Current(0))?;
+        self.index.push((key.to_string(), loc));
         write_record(&mut self.file, key, value)
     }
 
-    pub fn finish(self) {
-        // TODO: write the index
+    pub fn finish(&mut self) -> Result<(), io::Error> {
+        // Writes the index
+        let index_loc = self.file.seek(SeekFrom::Current(0))?;
+        for (key, loc) in &self.index {
+            let keybytes = key.as_bytes();
+            self.file.write_u32::<Endian>(keybytes.len() as u32)?;
+            self.file.write_all(keybytes)?;
+            self.file.write_u64::<Endian>(*loc)?;
+        }
+
+        let footer_loc = self.file.seek(SeekFrom::Current(0))?;
+        println!("Writing footer to {}", footer_loc);
+
+        // Writes the footer
+        self.file.write_all(SSTABLE_SIGNATURE.as_bytes())?;
+        self.file.write_u64::<Endian>(self.index.len() as u64)?;
+        self.file.write_u64::<Endian>(index_loc as u64)?;
+
+        self.finished = true;
+        Ok(())
+    }
+}
+
+impl Drop for SSTableBuilder {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish();
+        }
     }
 }
 
@@ -180,7 +272,8 @@ impl LsmTree {
 
             // Merges the mem table with the disk table
             let temppath = self.path.join("temp_records.db");
-            let mut file = fs::File::create(&temppath)?;
+            //let mut file = fs::File::create(&temppath)?;
+            let mut builder = SSTableBuilder::create(&temppath)?;
 
             let mut iter_mem = self.map.iter().peekable();
             let mut iter_disk = sstable.iter().peekable();
@@ -201,27 +294,29 @@ impl LsmTree {
                 match which {
                     MemNext => {
                         let record = iter_mem.next().unwrap();
-                        write_record(&mut file, record.0, record.1)?;
+                        builder.add(&record.0, &record.1)?;
                     },
                     DiskNext => {
                         let record = iter_disk.next().unwrap()?;
-                        write_record(&mut file, &record.0, &record.1)?;
+                        builder.add(&record.0, &record.1)?;
                     },
                     BothNext => {
                         let record = iter_mem.next().unwrap();
-                        write_record(&mut file, record.0, record.1)?;
-                        iter_disk.next();  // Drop
+                        builder.add(&record.0, &record.1)?;
+                        iter_disk.next().unwrap();  // Drop
                     },
                 }
             }
-            drop(file);
+            builder.finish()?;
+            drop(builder);
             fs::rename(temppath, dbpath)?;
         }
         else {
-            let mut file = fs::File::create(dbpath)?;
+            let mut builder = SSTableBuilder::create(&dbpath)?;
             for (key, value) in self.map.iter() {
-                write_record(&mut file, key, value)?;
+                builder.add(key, value)?;
             }
+            builder.finish();
         }
 
         self.map.clear();
@@ -235,7 +330,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use lsm::{LsmTree, SSTable, SSTableBuilder};
+    use {LsmTree, SSTable, SSTableBuilder};
     use tempfile::{NamedTempFile, Builder as TempDirBuilder, TempDir};
     use std::io;
     use rand::{Rng, SeedableRng, IsaacRng, self};
@@ -309,9 +404,9 @@ mod tests {
         T::from_seed(seed)
     }
 
-    fn make_random_keys<R: Rng>(rng: &mut R) -> Vec<String> {
+    fn make_random_keys<R: Rng>(rng: &mut R, n: usize) -> Vec<String> {
         let mut keys : Vec<String> = Vec::new();
-        for _ in 0..10 {
+        for _ in 0..n {
             let s : String = rng
                 .sample_iter(&rand::distributions::Alphanumeric)
                 .take(12).collect();
@@ -325,7 +420,7 @@ mod tests {
     fn sstable_multi() {
         // Random data
         let mut rng = make_seeded_rng::<IsaacRng>(53335);
-        let mut keys = make_random_keys(&mut rng);
+        let mut keys = make_random_keys(&mut rng, 10);
         keys.sort();
 
         // Creates the SSTable
@@ -343,6 +438,34 @@ mod tests {
         }
     }
 
+    #[test]
+    fn sstable_key_not_present() {
+        // Creates the SSTable
+        let file = NamedTempFile::new().unwrap();
+        let mut builder = SSTableBuilder::create(file.path()).unwrap();
+        builder.add("bar", "xbar");
+        builder.add("foo", "xfoo");
+        builder.finish();
 
-}
+        let mut sstable = SSTable::open(file.path());
+        assert_eq!(sstable.get("abracadabra").unwrap(), None);
+    }
+
+    #[test]
+    fn check_size() {
+        let letters = "abcdefg";
+
+        // Creates the SSTable
+        let file = NamedTempFile::new().unwrap();
+
+        let mut builder = SSTableBuilder::create(file.path()).unwrap();
+        for ch in letters.chars() {
+            let kv = format!("{}", ch);
+            builder.add(&kv, &kv).unwrap();
+        }
+        builder.finish();
+
+        let mut sstable = SSTable::open(file.path());
+        assert_eq!(sstable.len(), letters.len());
+    }
 }
