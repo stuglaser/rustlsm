@@ -1,8 +1,9 @@
 #![allow(dead_code, unused)]
 
-extern crate tempfile;
 extern crate byteorder;
 extern crate rand;
+extern crate tempfile;
+extern crate uuid;
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -22,6 +23,28 @@ use byteorder::LittleEndian as Endian;
 
 
 const SSTABLE_SIGNATURE : &'static str = "SSTB";
+
+/// Helpers for IO on strings with lengths
+trait VarStringIO {
+    fn write_varstring(&mut self, s: &str) -> Result<(), io::Error>;
+    fn read_varstring(&mut self) -> Result<String, io::Error>;
+}
+impl VarStringIO for fs::File {
+    fn write_varstring(&mut self, s: &str) -> Result<(), io::Error> {
+        let bytes = s.as_bytes();
+        self.write_u32::<Endian>(bytes.len() as u32)?;
+        self.write_all(bytes)?;
+        Ok(())
+    }
+
+    fn read_varstring(&mut self) -> Result<String, io::Error> {
+        let len = self.read_u32::<Endian>()? as usize;
+
+        let mut buf = vec![0 as u8; len];
+        self.read_exact(&mut buf)?;
+        Ok(String::from_utf8(buf).unwrap())
+    }
+}
 
 pub struct SSTable {
     path: PathBuf,
@@ -113,12 +136,12 @@ impl<'a> Iterator for SSTableIter<'a> {
 impl<'a> ExactSizeIterator for SSTableIter<'a> {}
 
 impl SSTable {
-    pub fn open(path: &Path) -> SSTable {
+    pub fn open(path: &Path) -> Result<SSTable, io::Error> {
         let mut sstable = SSTable{ path: path.to_path_buf(),
                                    size: 0,
                                    index: HashMap::new() };
-        sstable.preload().unwrap();
-        sstable
+        sstable.preload()?;
+        Ok(sstable)
     }
 
     fn preload(&mut self) -> Result<(), io::Error> {
@@ -127,7 +150,6 @@ impl SSTable {
         // Reads the footer
         file.seek(SeekFrom::End(-20))?;
         let footer_loc = file.seek(SeekFrom::Current(0))?;
-        println!("Reading footer from {}", footer_loc);
 
         // Reads the signature
         let mut signature = [0; 4];
@@ -210,7 +232,6 @@ impl SSTableBuilder {
         }
 
         let footer_loc = self.file.seek(SeekFrom::Current(0))?;
-        println!("Writing footer to {}", footer_loc);
 
         // Writes the footer
         self.file.write_all(SSTABLE_SIGNATURE.as_bytes())?;
@@ -230,9 +251,44 @@ impl Drop for SSTableBuilder {
     }
 }
 
+pub struct Options {
+    sstable_size: usize,
+    level0_size: usize,
+    level1_size: usize,
+    level_size_factor: usize,
+}
+
+impl Options {
+    pub fn default() -> Options {
+        Options{sstable_size: 4096,
+                level0_size: 4,
+                level1_size: 10,
+                level_size_factor: 10}
+    }
+
+    // Options for testing; makes everything tiny so compactions are more
+    // serious.
+    pub fn tiny() -> Options {
+        Options{sstable_size: 1,
+                level0_size: 2,
+                level1_size: 4,
+                level_size_factor: 2}
+    }
+}
+
+/// Describes a particular SSTable
+struct SlabInfo {
+    level: usize,
+    key_min: String,
+    key_max: String,
+    filename: String,
+}
+
 pub struct LsmTree {
     path: PathBuf,
-    map: BTreeMap<String, String>
+    options: Options,
+    map: BTreeMap<String, String>,
+    slabs: Vec<SlabInfo>,
 }
 
 enum Which {
@@ -242,9 +298,15 @@ enum Which {
 }
 
 impl LsmTree {
-    pub fn new(path: &Path) -> LsmTree {
-        return LsmTree{ path: path.to_path_buf(), map: BTreeMap::new() };
+    pub fn new(path: &Path, options: Options) -> LsmTree {
+        let mut tree = LsmTree{ path: path.to_path_buf(),
+                                options: options,
+                                map: BTreeMap::new(),
+                                slabs: Vec::new(), };
+        tree.load_metadata();
+        tree
     }
+
     fn set(&mut self, key: &str, value: &str) {
         self.map.insert(key.to_string(), value.to_string());
     }
@@ -254,25 +316,112 @@ impl LsmTree {
             return Some(s.to_string());
         }
 
-        // Searches through the DB file
-        let dbpath = self.path.join("records.db");
-        if dbpath.exists() {
-            let mut sstable = SSTable::open(&dbpath);
-            return sstable.get(key).unwrap();  // TODO: unwrap
+        // TODO: There is some magic baked in here. Slabs in level0 can have
+        // overlapping key ranges, so if they disagree which value should we
+        // use? Since we always append the latest slab to `slabs`, the correct
+        // value to use is the one from the level0 slab that comes latest in the
+        // `slabs` list.  If we change how slabs are stored, this will break.
+
+        // Searches through the slabs
+        let mut level : usize = 999;
+        let mut value = String::new();
+        for slab in &self.slabs {
+            if slab.key_min.as_str() <= key && key <= slab.key_max.as_str() {
+                let path = self.path.join(&slab.filename);
+                let mut sstable = SSTable::open(&path).unwrap();  // TODO: poor unwrap
+                if let Some(v) = sstable.get(key).unwrap() { // TODO: poor unwrap
+                    if slab.level <= level {
+                        level = slab.level;
+                        value = v;
+                    }
+                }
+            }
         }
 
-        // key wasn't found anywhere
-        None
+        match level{
+            999 => None,  // Not found
+            _ => Some(value),
+        }
+    }
+
+    fn flush_metadata(&mut self) -> Result<(), io::Error> {
+        let temppath = self.path.join("METADATA.temp");
+        let mut file = fs::File::create(&temppath)?;
+
+        file.write_u64::<Endian>(self.slabs.len() as u64)?;
+        for slab in &self.slabs {
+            file.write_u16::<Endian>(slab.level as u16)?;
+            file.write_varstring(&slab.key_min)?;
+            file.write_varstring(&slab.key_max)?;
+            file.write_varstring(&slab.filename)?;
+        }
+
+        drop(file);  // Flush
+        fs::rename(temppath, self.path.join("METADATA"));
+        Ok(())
+    }
+
+    fn load_metadata(&mut self) -> Result<(), io::Error> {
+        let path = self.path.join("METADATA");
+        if !path.exists() {
+            return Ok(())  // Nothing to load
+        }
+        let mut file = fs::File::open(path)?;
+
+        let size = file.read_u64::<Endian>()?;
+        let mut slabs : Vec<SlabInfo> = Vec::new();
+        for _ in 0..size {
+            let level = file.read_u16::<Endian>()? as usize;
+            let key_min = file.read_varstring()?;
+            let key_max = file.read_varstring()?;
+            let filename = file.read_varstring()?;
+            slabs.push(SlabInfo{ level: level,
+                                 key_min: key_min, key_max: key_max,
+                                 filename: filename });
+        }
+
+        self.slabs = slabs;
+        Ok(())
+    }
+
+    /// Flushes the current memtable to a new slab in level0
+    pub fn flush(&mut self) -> Result<(), io::Error> {
+        if self.map.is_empty() {
+            return Ok(())  // Nothing to do
+        }
+
+        // Specifies the new slab
+        use uuid::Uuid;
+        let uuid = Uuid::new_v4();
+        let new_slab = SlabInfo{
+            level: 0,
+            key_min: self.map.keys().next().unwrap().to_string(),
+            key_max: self.map.keys().next_back().unwrap().to_string(),
+            filename: format!("slab_l00_{}.sst", uuid.to_hyphenated())};
+
+        // Writes the slab to disk
+        let mut builder = SSTableBuilder::create(&self.path.join(&new_slab.filename))?;
+        for item in &self.map {
+            builder.add(&item.0, &item.1)?;
+        }
+        builder.finish()?;
+
+        self.slabs.push(new_slab);
+        self.flush_metadata()?;
+        self.map.clear();
+
+        Ok(())
     }
 
     pub fn compact(&mut self) -> Result<(), io::Error> {
+        // TODO: Totally broken and useless right now
+
         let dbpath = self.path.join("records.db");
         if dbpath.exists() {
-            let mut sstable = SSTable::open(&dbpath);
+            let mut sstable = SSTable::open(&dbpath)?;
 
             // Merges the mem table with the disk table
             let temppath = self.path.join("temp_records.db");
-            //let mut file = fs::File::create(&temppath)?;
             let mut builder = SSTableBuilder::create(&temppath)?;
 
             let mut iter_mem = self.map.iter().peekable();
@@ -330,14 +479,14 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use {LsmTree, SSTable, SSTableBuilder};
+    use {LsmTree, Options, SSTable, SSTableBuilder};
     use tempfile::{NamedTempFile, Builder as TempDirBuilder, TempDir};
     use std::io;
     use rand::{Rng, SeedableRng, IsaacRng, self};
 
     fn create_temp_db() -> Result<(TempDir, LsmTree), io::Error> {
         let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir()?;
-        let tree = LsmTree::new(tmp_dir.path());
+        let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
         println!("Created temp dir {:?}", tmp_dir);
         return Result::Ok((tmp_dir, tree));
     }
@@ -350,11 +499,43 @@ mod tests {
     }
 
     #[test]
+    fn check_persists_single_key_flush() {
+        let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir().unwrap();
+        {
+            let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            println!("Created temp dir {:?}", tmp_dir);
+            tree.set("foo", "bar");
+            tree.flush().unwrap();
+        }
+
+        {
+            let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            assert_eq!(tree.get("foo"), Some("bar".to_string()));
+        }
+    }
+
+    /*  TODO: add back in when we implement WAL
+    #[test]
+    fn check_persists_single_key_noflush() {
+        let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir().unwrap();
+        {
+            let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            println!("Created temp dir {:?}", tmp_dir);
+            tree.set("foo", "bar");
+        }
+
+        {
+            let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            assert_eq!(tree.get("foo"), Some("bar".to_string()));
+        }
+    }*/
+
+    #[test]
     fn single_value_compact() -> Result<(), io::Error> {
         let (dir, mut tree) = create_temp_db().unwrap();
 
         tree.set("foo", "bar");
-        tree.compact().unwrap();
+        tree.flush().unwrap();
         assert_eq!(tree.get("foo"), Some("bar".to_string()));
         Ok(())
     }
@@ -364,13 +545,13 @@ mod tests {
         let (dir, mut tree) = create_temp_db().unwrap();
 
         tree.set("foo", "valfoo");
-        tree.compact().unwrap();
+        tree.flush().unwrap();
         tree.set("bar", "valbar");
 
         assert_eq!(tree.get("foo"), Some("valfoo".to_string()), "after 1 compact");
         assert_eq!(tree.get("bar"), Some("valbar".to_string()), "after 1 compact");
 
-        tree.compact().unwrap();
+        tree.flush().unwrap();
         assert_eq!(tree.get("foo"), Some("valfoo".to_string()), "after 2 compacts");
         assert_eq!(tree.get("bar"), Some("valbar".to_string()), "after 2 compacts");
 
@@ -432,7 +613,7 @@ mod tests {
         }
         builder.finish();
 
-        let mut sstable = SSTable::open(file.path());
+        let mut sstable = SSTable::open(file.path()).unwrap();
         for k in &keys {
             assert_eq!(sstable.get(k).unwrap(), Some(format!("xx_{}", k)));
         }
@@ -447,7 +628,7 @@ mod tests {
         builder.add("foo", "xfoo");
         builder.finish();
 
-        let mut sstable = SSTable::open(file.path());
+        let mut sstable = SSTable::open(file.path()).unwrap();
         assert_eq!(sstable.get("abracadabra").unwrap(), None);
     }
 
@@ -465,7 +646,7 @@ mod tests {
         }
         builder.finish();
 
-        let mut sstable = SSTable::open(file.path());
+        let mut sstable = SSTable::open(file.path()).unwrap();
         assert_eq!(sstable.len(), letters.len());
     }
 }

@@ -65,7 +65,7 @@ fn criterion_benchmark(c: &mut Criterion) {
     builder.finish().unwrap();
     drop(builder);
 
-    let mut sstable = SSTable::open(file.path());
+    let mut sstable = SSTable::open(file.path()).unwrap();
     let n = (keys.len() as f32 * 0.9) as usize;
     c.bench_function("sstable.get", move |b| b.iter(|| sstable.get(&keys[n]).unwrap()));
 }
