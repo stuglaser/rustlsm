@@ -4,9 +4,10 @@ extern crate byteorder;
 extern crate rand;
 extern crate tempfile;
 extern crate uuid;
+extern crate owning_ref;
 
 use std::collections::BTreeMap;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::path::PathBuf;
 use std::io;
@@ -16,6 +17,7 @@ use std::io::ErrorKind::UnexpectedEof;
 use std::cmp::max;
 use std::str;
 use std::marker::PhantomData;
+use owning_ref::OwningHandle;
 
 use byteorder::*;
 
@@ -92,14 +94,14 @@ fn read_record(file: &mut fs::File) -> Option<Result<(String, String), io::Error
 }
 
 fn write_record(file: &mut fs::File, key: &str, value: &str)
-                -> Result<(), io::Error> {
+                -> Result<usize, io::Error> {
     let keybytes = key.as_bytes();
     let valuebytes = value.as_bytes();
     file.write_u32::<Endian>(keybytes.len() as u32)?;
     file.write_u32::<Endian>(valuebytes.len() as u32)?;
     file.write_all(keybytes)?;
     file.write_all(valuebytes)?;
-    Ok(())
+    Ok((4 + 4 + keybytes.len() + valuebytes.len()))
 }
 
 impl<'a> SSTableIter<'a> {
@@ -176,7 +178,7 @@ impl SSTable {
         Ok(())
     }
 
-    pub fn iter<'a>(&'a mut self) -> SSTableIter {
+    pub fn iter<'a>(&'a self) -> SSTableIter {
         let mut file = fs::File::open(&self.path).unwrap();
         SSTableIter::<'a>{file: file,
                           sstable: self,
@@ -203,6 +205,7 @@ impl SSTable {
 pub struct SSTableBuilder {
     file: fs::File,
     index: Vec<(String, u64)>,
+    bytes_written: usize,
     finished: bool,
 }
 
@@ -211,6 +214,7 @@ impl SSTableBuilder {
         Ok(SSTableBuilder{
             file: fs::File::create(path)?,
             index: Vec::new(),
+            bytes_written: 0,
             finished: false})
     }
 
@@ -218,7 +222,13 @@ impl SSTableBuilder {
         assert!(!self.finished);
         let loc = self.file.seek(SeekFrom::Current(0))?;
         self.index.push((key.to_string(), loc));
-        write_record(&mut self.file, key, value)
+        let bytes = write_record(&mut self.file, key, value)?;
+        self.bytes_written += bytes;
+        Ok(())
+    }
+
+    pub fn bytes_written(&self) -> usize {
+        self.bytes_written
     }
 
     pub fn finish(&mut self) -> Result<(), io::Error> {
@@ -241,12 +251,83 @@ impl SSTableBuilder {
         self.finished = true;
         Ok(())
     }
+
+    pub fn key_bounds(&self) -> (&str, &str) {
+        (&self.index[0].0, &self.index.last().unwrap().0)
+    }
 }
 
 impl Drop for SSTableBuilder {
     fn drop(&mut self) {
         if !self.finished {
             self.finish();
+        }
+    }
+}
+
+/// Holds an SSTable and an iter to it together
+type SSTableIterHandle = OwningHandle<Box<SSTable>, Box<SSTableIter<'static>>>;
+
+/// For iterating through a list of SSTable's
+struct SSTableChainer {
+    sources: Vec<PathBuf>,
+    idx: usize,
+    current_iter: Option<SSTableIterHandle>,
+}
+
+impl SSTableChainer {
+    pub fn new(sources: Vec<PathBuf>) -> Result<Self, io::Error> {
+        let oh = if sources.len() == 0 {
+            None
+        }
+        else {
+            Some(SSTableChainer::iter_on_file(&sources[0])?)
+        };
+        Ok(SSTableChainer{
+            sources: sources,
+            idx: 0,
+            current_iter: oh,
+        })
+    }
+
+    fn iter_on_file(path: &PathBuf) ->
+        Result<SSTableIterHandle, io::Error>
+    {
+        let sstable = Box::new(SSTable::open(path)?);
+        Ok(OwningHandle::new_with_fn(
+            sstable,
+            |s| unsafe { Box::new((*s).iter()) } ))
+    }
+}
+
+impl Iterator for SSTableChainer {
+    type Item = Result<(String, String), io::Error>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        loop {
+            let item = match self.current_iter {
+                None => return None,
+                Some(ref mut iter) => iter.next(),
+            };
+
+            if item.is_some() {
+                // TODO: probably want to force ending this iteration on error
+                return item;
+            }
+
+            // Advance
+            self.idx += 1;
+            self.current_iter = {
+                if self.idx == self.sources.len() {
+                    None
+                }
+                else {
+                    match Self::iter_on_file(&self.sources[self.idx]) {
+                        Ok(handle) => Some(handle),
+                        Err(err) => return Some(Err(err)),
+                    }
+                }
+            };
         }
     }
 }
@@ -277,11 +358,86 @@ impl Options {
 }
 
 /// Describes a particular SSTable
+#[derive(Clone, Debug)]
 struct SlabInfo {
     level: usize,
     key_min: String,
     key_max: String,
     filename: String,
+}
+
+impl SlabInfo {
+    pub fn overlaps(&self, other : &SlabInfo) -> bool {
+        !(self.key_max < other.key_min ||
+          self.key_min > other.key_max)
+    }
+}
+
+/// Writes out a sequence of SSTables with a size threshold
+struct SSTableStreamWriter<Namer>
+    where Namer: Fn() -> String
+{
+    dir: PathBuf,
+    level: usize,
+    new_file_fn: Namer,
+    size_threshold: usize,
+
+    current_filename: String,
+    current_builder: SSTableBuilder,
+    slabs: Vec<SlabInfo>,
+}
+
+impl<Namer> SSTableStreamWriter<Namer>
+    where Namer: Fn() -> String
+{
+    pub fn new(dir: &Path,
+               level: usize,
+               new_file_fn: Namer,
+               size_threshold: usize) -> Result<Self, io::Error>
+    {
+        let filename = new_file_fn();
+        let builder = SSTableBuilder::create(&dir.join(&filename))?;
+        Ok(Self{
+            dir: dir.to_path_buf(),
+            level: level,
+            new_file_fn: new_file_fn,
+            size_threshold: size_threshold,
+            current_filename: filename,
+            current_builder: builder,
+            slabs: Vec::new(),
+        })
+    }
+
+    fn finalize_current_sstable(&mut self) -> Result<(), io::Error> {
+        {
+            let key_bounds = self.current_builder.key_bounds();
+            self.slabs.push(SlabInfo{
+                level: self.level,
+                key_min: key_bounds.0.to_string(),
+                key_max: key_bounds.1.to_string(),
+                filename: self.current_filename.clone(),
+            });
+        }
+        self.current_builder.finish()
+    }
+
+    pub fn add(&mut self, key: &str, value: &str) -> Result<(), io::Error> {
+        if self.current_builder.bytes_written() > self.size_threshold {
+            self.finalize_current_sstable()?;
+
+            // Creates a new SSTable
+            self.current_filename = (self.new_file_fn)();
+            self.current_builder = SSTableBuilder::create(
+                &self.dir.join(&self.current_filename))?;
+        }
+
+        self.current_builder.add(key, value)
+    }
+
+    pub fn finish(mut self) -> Result<Vec<SlabInfo>, io::Error> {
+        self.finalize_current_sstable()?;
+        Ok(self.slabs)
+    }
 }
 
 pub struct LsmTree {
@@ -291,9 +447,16 @@ pub struct LsmTree {
     slabs: Vec<SlabInfo>,
 }
 
-enum Which {
+enum WhichOld {
     MemNext,
     DiskNext,
+    BothNext,
+}
+
+enum Which {
+    Finished,
+    TargetNext,
+    OverlapsNext,
     BothNext,
 }
 
@@ -384,6 +547,12 @@ impl LsmTree {
         Ok(())
     }
 
+    fn new_slab_filename(&self, level: usize) -> String {
+        use uuid::Uuid;
+        let uuid = Uuid::new_v4();
+        format!("slab_l{:02}_{}.sst", level, uuid.to_hyphenated())
+    }
+
     /// Flushes the current memtable to a new slab in level0
     pub fn flush(&mut self) -> Result<(), io::Error> {
         if self.map.is_empty() {
@@ -397,7 +566,7 @@ impl LsmTree {
             level: 0,
             key_min: self.map.keys().next().unwrap().to_string(),
             key_max: self.map.keys().next_back().unwrap().to_string(),
-            filename: format!("slab_l00_{}.sst", uuid.to_hyphenated())};
+            filename: self.new_slab_filename(0) };
 
         // Writes the slab to disk
         let mut builder = SSTableBuilder::create(&self.path.join(&new_slab.filename))?;
@@ -411,6 +580,148 @@ impl LsmTree {
         self.map.clear();
 
         Ok(())
+    }
+
+    fn get_target_slab(&self, level: usize) -> SlabInfo {
+        let level_sstables : Vec<&SlabInfo> = self.slabs.iter()
+            .filter(|s| s.level == level as usize)
+            .collect();
+        assert!(level_sstables.len() > 0); // Sanity
+
+        // Selects a random sstable to compact.
+        // TODO: There are better algorithms
+        use rand::Rng;
+        let n : usize = rand::thread_rng().gen_range(0, level_sstables.len() - 1);
+        let target = level_sstables[n];
+        target.to_owned()
+    }
+
+    pub fn maybe_compact(&mut self) -> Result<bool, io::Error> {
+        // TODO: lock
+
+        // Counts the number of sstables at each level
+        let mut count = vec![0; 20]; // TODO: max levels assumed
+        for slab in &self.slabs {
+            count[slab.level] += 1;
+        }
+
+        // Finds the lowest level that's too big
+        let mut level_to_compact : isize = -1;
+        if count[0] > self.options.level0_size {
+            level_to_compact = 0;
+        }
+        else {
+            let mut max_size = self.options.level1_size;
+            for i in 1..count.len() {
+                if count[i] > max_size {
+                    level_to_compact = i as isize;
+                    break;
+                }
+                max_size *= self.options.level_size_factor;
+            }
+        }
+
+        // Compacts this level
+        if level_to_compact < 0 {
+            Ok(false)
+        }
+        else {
+            // Picks a target SSTable to compact
+            let target = {
+                let level_sstables : Vec<&SlabInfo> = self.slabs.iter()
+                    .filter(|s| s.level == level_to_compact as usize)
+                    .collect();
+                assert!(level_sstables.len() > 0); // Sanity
+
+                // Selects a random sstable to compact.
+                // TODO: There are better algorithms
+                use rand::Rng;
+                let n : usize = rand::thread_rng().gen_range(0, level_sstables.len() - 1);
+                level_sstables[n].clone()
+            };
+
+            // Sets up iteration over the target sstable to merge from
+            let target_sstable = SSTable::open(&self.path.join(&target.filename))?;
+            let mut iter_target = target_sstable.iter().peekable();
+
+            // Finds the SSTables to merge the target with
+            let overlaps : Vec<SlabInfo> = {
+                let mut overlaps : Vec<&SlabInfo> = self.slabs.iter()
+                    .filter(|s|
+                            s.level == target.level + 1 &&
+                            target.overlaps(s))
+                    .collect();
+                overlaps.sort_unstable_by_key(|s| &s.key_min);
+                let overlaps : Vec<SlabInfo> = overlaps.drain(..).map(|s| s.clone()).collect();
+                overlaps
+            };
+            let overlaps_paths = overlaps.iter().map(
+                |info| self.path.join(&info.filename)).collect();
+            let mut iter_overlaps = SSTableChainer::new(overlaps_paths)?.peekable();
+
+            let new_slabs = {
+                // Output streamer
+                let mut streamer = SSTableStreamWriter::new(
+                    &self.path,
+                    target.level + 1,
+                    || self.new_slab_filename(target.level + 1),
+                    self.options.sstable_size * 1024)?;
+
+                // Here we go.  We will...
+                // .. merge iter_target and iter_overlaps
+                // .. into streamer
+                // .. doing bookkeeping in new_slabs
+
+                loop {
+                    use self::Which::*;
+                    let which = match (iter_target.peek(), iter_overlaps.peek()) {
+                        (None, None) => Finished,
+                        (Some(_), None) => TargetNext,
+                        (None, Some(_)) => OverlapsNext,
+                        (Some(Err(_)), _) => TargetNext, // Force error below
+                        (_, Some(Err(_))) => OverlapsNext, // Force error below
+                        (Some(Ok(target)), Some(Ok(overlap))) => {
+                            if target.0 == overlap.0 { BothNext }
+                            else if target.0 < overlap.0 { TargetNext }
+                            else { OverlapsNext }
+                        },
+                    };
+
+                    match which {
+                        TargetNext => {
+                            let record = iter_target.next().unwrap()?;
+                            streamer.add(&record.0, &record.1)?;
+                        },
+                        OverlapsNext => {
+                            let record = iter_overlaps.next().unwrap()?;
+                            streamer.add(&record.0, &record.1)?;
+                        },
+                        BothNext => {
+                            let record = iter_target.next().unwrap()?;
+                            streamer.add(&record.0, &record.1)?;
+                            iter_overlaps.next().unwrap()?;  // Drop
+                        },
+                        Finished => break
+                    }
+                }
+                streamer.finish()?
+            };
+
+            // Merging done.  Updates our records of the current SSTables
+
+            let mut slabs_to_remove : HashSet<&str> = HashSet::new();
+            slabs_to_remove.insert(&target.filename);
+            for slab in &overlaps {
+                slabs_to_remove.insert(&slab.filename);
+            }
+            // TODO: lock
+            self.slabs.retain(|s| !slabs_to_remove.contains(s.filename.as_str()));
+            self.slabs.extend(new_slabs);
+
+            self.flush_metadata()?;
+
+            Ok(true)
+        }
     }
 
     pub fn compact(&mut self) -> Result<(), io::Error> {
@@ -427,7 +738,7 @@ impl LsmTree {
             let mut iter_mem = self.map.iter().peekable();
             let mut iter_disk = sstable.iter().peekable();
             loop {
-                use self::Which::*;
+                use self::WhichOld::*;
                 let which = match (iter_mem.peek(), iter_disk.peek()) {
                     (None, None) => break,
                     (Some(_), None) => MemNext,
@@ -536,6 +847,7 @@ mod tests {
 
         tree.set("foo", "bar");
         tree.flush().unwrap();
+        tree.maybe_compact().unwrap();
         assert_eq!(tree.get("foo"), Some("bar".to_string()));
         Ok(())
     }
@@ -591,7 +903,6 @@ mod tests {
             let s : String = rng
                 .sample_iter(&rand::distributions::Alphanumeric)
                 .take(12).collect();
-            //println!("S = {}", s);
             keys.push(s);
         }
         keys
@@ -648,5 +959,36 @@ mod tests {
 
         let mut sstable = SSTable::open(file.path()).unwrap();
         assert_eq!(sstable.len(), letters.len());
+    }
+
+    #[test]
+    fn check_for_compactions() {
+        let (dir, mut tree) = create_temp_db().unwrap();
+
+        // Random data
+        let mut rng = make_seeded_rng::<IsaacRng>(53335);
+        let mut keys = make_random_keys(&mut rng, 1000);
+
+        let mut num_compactions : usize = 0;
+        for (i, key) in keys.iter().enumerate() {
+            tree.set(key, &format!("x_{}", key));
+            if (i + 1) % 10 == 0 {
+                tree.flush().unwrap();
+                while tree.maybe_compact().unwrap() {
+                    num_compactions += 1;
+                }
+            }
+        }
+
+        println!("{} compactions", num_compactions);
+
+        let mut tmp = tree.slabs.clone();
+        tmp.sort_unstable_by_key(|s| format!("{:02}__{}", s.level, s.key_min));
+        for slab in tmp {
+            println!("Slab: {:?}", slab);
+        }
+
+        //dir.into_path();
+        assert_eq!(999, 888);
     }
 }
