@@ -582,6 +582,7 @@ impl LsmTree {
         Ok(())
     }
 
+    /// Selects an SSTable, from a certain level, that should be compacted
     fn get_target_slab(&self, level: usize) -> SlabInfo {
         let level_sstables : Vec<&SlabInfo> = self.slabs.iter()
             .filter(|s| s.level == level as usize)
@@ -714,11 +715,19 @@ impl LsmTree {
             for slab in &overlaps {
                 slabs_to_remove.insert(&slab.filename);
             }
+
+            // Rewrites the metadata
             // TODO: lock
             self.slabs.retain(|s| !slabs_to_remove.contains(s.filename.as_str()));
             self.slabs.extend(new_slabs);
-
             self.flush_metadata()?;
+
+            // Deletes old SSTables
+            for filename in slabs_to_remove {
+                let path = self.path.join(filename);
+                assert!(path.exists());
+                fs::remove_file(path)?;
+            }
 
             Ok(true)
         }
@@ -781,6 +790,14 @@ impl LsmTree {
 
         self.map.clear();
         Ok(())
+    }
+
+    pub fn dump_metadata(&self) {
+        let mut tmp = self.slabs.clone();
+        tmp.sort_unstable_by_key(|s| format!("{:02}__{}", s.level, s.key_min));
+        for slab in tmp {
+            println!("Slab: {:?}", slab);
+        }
     }
 }
 
@@ -980,15 +997,13 @@ mod tests {
             }
         }
 
-        println!("{} compactions", num_compactions);
-
-        let mut tmp = tree.slabs.clone();
-        tmp.sort_unstable_by_key(|s| format!("{:02}__{}", s.level, s.key_min));
-        for slab in tmp {
-            println!("Slab: {:?}", slab);
-        }
-
+        //println!("{} compactions", num_compactions);
+        //tree.dump_metadata();
         //dir.into_path();
-        assert_eq!(999, 888);
+
+        for key in keys {
+            let value = format!("x_{}", key);
+            assert_eq!(tree.get(&key), Some(value));
+        }
     }
 }
