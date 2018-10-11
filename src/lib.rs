@@ -447,12 +447,6 @@ pub struct LsmTree {
     slabs: Vec<SlabInfo>,
 }
 
-enum WhichOld {
-    MemNext,
-    DiskNext,
-    BothNext,
-}
-
 enum Which {
     Finished,
     TargetNext,
@@ -589,6 +583,14 @@ impl LsmTree {
             .collect();
         assert!(level_sstables.len() > 0); // Sanity
 
+
+        if level == 0 {
+            // We absolutely must choose the oldest SSTable on the first
+            // level to compact. This way older values go to lower
+            // levels before newer values.
+            return level_sstables[0].clone();
+        }
+
         // Selects a random sstable to compact.
         // TODO: There are better algorithms
         use rand::Rng;
@@ -628,18 +630,7 @@ impl LsmTree {
         }
         else {
             // Picks a target SSTable to compact
-            let target = {
-                let level_sstables : Vec<&SlabInfo> = self.slabs.iter()
-                    .filter(|s| s.level == level_to_compact as usize)
-                    .collect();
-                assert!(level_sstables.len() > 0); // Sanity
-
-                // Selects a random sstable to compact.
-                // TODO: There are better algorithms
-                use rand::Rng;
-                let n : usize = rand::thread_rng().gen_range(0, level_sstables.len() - 1);
-                level_sstables[n].clone()
-            };
+            let target = self.get_target_slab(level_to_compact as usize);
 
             // Sets up iteration over the target sstable to merge from
             let target_sstable = SSTable::open(&self.path.join(&target.filename))?;
@@ -731,65 +722,6 @@ impl LsmTree {
 
             Ok(true)
         }
-    }
-
-    pub fn compact(&mut self) -> Result<(), io::Error> {
-        // TODO: Totally broken and useless right now
-
-        let dbpath = self.path.join("records.db");
-        if dbpath.exists() {
-            let mut sstable = SSTable::open(&dbpath)?;
-
-            // Merges the mem table with the disk table
-            let temppath = self.path.join("temp_records.db");
-            let mut builder = SSTableBuilder::create(&temppath)?;
-
-            let mut iter_mem = self.map.iter().peekable();
-            let mut iter_disk = sstable.iter().peekable();
-            loop {
-                use self::WhichOld::*;
-                let which = match (iter_mem.peek(), iter_disk.peek()) {
-                    (None, None) => break,
-                    (Some(_), None) => MemNext,
-                    (None, Some(_)) => DiskNext,
-                    (_, Some(Err(_))) => DiskNext, // Force disk error below
-                    (Some(mem), Some(Ok(disk))) => {
-                        if mem.0 == &disk.0 { BothNext }
-                        else if mem.0 < &disk.0 { MemNext }
-                        else { DiskNext }
-                    },
-                };
-
-                match which {
-                    MemNext => {
-                        let record = iter_mem.next().unwrap();
-                        builder.add(&record.0, &record.1)?;
-                    },
-                    DiskNext => {
-                        let record = iter_disk.next().unwrap()?;
-                        builder.add(&record.0, &record.1)?;
-                    },
-                    BothNext => {
-                        let record = iter_mem.next().unwrap();
-                        builder.add(&record.0, &record.1)?;
-                        iter_disk.next().unwrap();  // Drop
-                    },
-                }
-            }
-            builder.finish()?;
-            drop(builder);
-            fs::rename(temppath, dbpath)?;
-        }
-        else {
-            let mut builder = SSTableBuilder::create(&dbpath)?;
-            for (key, value) in self.map.iter() {
-                builder.add(key, value)?;
-            }
-            builder.finish();
-        }
-
-        self.map.clear();
-        Ok(())
     }
 
     pub fn dump_metadata(&self) {
