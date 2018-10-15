@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::io::{Read, Write, Seek, SeekFrom};
+use std::io::{Read, Write, BufWriter, Seek, SeekFrom};
 use std::io::ErrorKind::UnexpectedEof;
 use std::path::Path;
 use std::path::PathBuf;
@@ -102,7 +102,8 @@ fn write_record(file: &mut fs::File, key: &str, value: &str)
     file.write_u32::<Endian>(valuebytes.len() as u32)?;
     file.write_all(keybytes)?;
     file.write_all(valuebytes)?;
-    Ok((4 + 4 + keybytes.len() + valuebytes.len()))
+    //Ok((4 + 4 + keybytes.len() + valuebytes.len()))
+    Ok((4 + 4 + keybytes.len() + valuebytes.len() + 4 + keybytes.len()))
 }
 
 impl<'a> SSTableIter<'a> {
@@ -206,7 +207,7 @@ impl SSTable {
 pub struct SSTableBuilder {
     file: fs::File,
     index: Vec<(String, u64)>,
-    bytes_written: usize,
+    estimated_size_bytes: usize,
     finished: bool,
 }
 
@@ -215,7 +216,7 @@ impl SSTableBuilder {
         Ok(SSTableBuilder{
             file: fs::File::create(path)?,
             index: Vec::new(),
-            bytes_written: 0,
+            estimated_size_bytes: 0,
             finished: false})
     }
 
@@ -224,12 +225,12 @@ impl SSTableBuilder {
         let loc = self.file.seek(SeekFrom::Current(0))?;
         self.index.push((key.to_string(), loc));
         let bytes = write_record(&mut self.file, key, value)?;
-        self.bytes_written += bytes;
+        self.estimated_size_bytes += bytes;
         Ok(())
     }
 
     pub fn bytes_written(&self) -> usize {
-        self.bytes_written
+        self.estimated_size_bytes
     }
 
     pub fn finish(&mut self) -> Result<(), io::Error> {
@@ -334,9 +335,6 @@ impl Iterator for SSTableChainer {
 }
 
 pub struct Options {
-    /// Max length of the memtable
-    memtable_len: usize,
-
     /// Target size of an sstable in kb
     sstable_size: usize,
 
@@ -350,8 +348,7 @@ pub struct Options {
 
 impl Options {
     pub fn default() -> Options {
-        Options{memtable_len: 256,
-                sstable_size: 4096,
+        Options{sstable_size: 4096,
                 level0_size: 4,
                 level1_size: 10,
                 level_size_factor: 10,
@@ -361,8 +358,7 @@ impl Options {
     // Options for testing; makes everything tiny so compactions are more
     // serious.
     pub fn tiny() -> Options {
-        Options{memtable_len: 8,  // Irrelevent since we don't compact automatically here
-                sstable_size: 1,
+        Options{sstable_size: 1,
                 level0_size: 2,
                 level1_size: 4,
                 level_size_factor: 2,
@@ -435,6 +431,7 @@ impl<Namer> SSTableStreamWriter<Namer>
     }
 
     pub fn add(&mut self, key: &str, value: &str) -> Result<(), io::Error> {
+        //println!("{} vs {}  into {}", self.current_builder.bytes_written(), self.size_threshold, self.current_filename);
         if self.current_builder.bytes_written() > self.size_threshold {
             self.finalize_current_sstable()?;
 
@@ -457,6 +454,7 @@ struct LsmTreeInner {
     path: PathBuf,
     options: Options,
     map: BTreeMap<String, String>,
+    memtable_size: usize,  // Estimate of bytes of the memtable
     slabs: Vec<SlabInfo>,
 }
 
@@ -472,6 +470,7 @@ impl LsmTreeInner {
         let mut tree = Self{ path: path.to_path_buf(),
                              options: options,
                              map: BTreeMap::new(),
+                             memtable_size: 0,
                              slabs: Vec::new(), };
         tree.load_metadata();
         tree
@@ -479,11 +478,15 @@ impl LsmTreeInner {
 
     fn set(&mut self, key: &str, value: &str) {
         self.map.insert(key.to_string(), value.to_string());
+
+        // Very rough estimate of memtable size. Doesn't currently include the
+        // size of the index of the sstable.
+        self.memtable_size += (key.len() + value.len());
     }
 
-    fn get(&self, key: &str) -> Option<String> {
+    fn get(&self, key: &str) -> Result<Option<String>, io::Error> {
         if let Some(s) = self.map.get(key) {
-            return Some(s.to_string());
+            return Ok(Some(s.to_string()));
         }
 
         // TODO: There is some magic baked in here. Slabs in level0 can have
@@ -498,8 +501,8 @@ impl LsmTreeInner {
         for slab in &self.slabs {
             if slab.key_min.as_str() <= key && key <= slab.key_max.as_str() {
                 let path = self.path.join(&slab.filename);
-                let mut sstable = SSTable::open(&path).unwrap();  // TODO: poor unwrap
-                if let Some(v) = sstable.get(key).unwrap() { // TODO: poor unwrap
+                let mut sstable = SSTable::open(&path)?;
+                if let Some(v) = sstable.get(key)? {
                     if slab.level <= level {
                         level = slab.level;
                         value = v;
@@ -508,10 +511,10 @@ impl LsmTreeInner {
             }
         }
 
-        match level{
+        Ok(match level{
             999 => None,  // Not found
             _ => Some(value),
-        }
+        })
     }
 
     fn flush_metadata(&mut self) -> Result<(), io::Error> {
@@ -586,6 +589,7 @@ impl LsmTreeInner {
         self.slabs.push(new_slab);
         self.flush_metadata()?;
         self.map.clear();
+        self.memtable_size = 0;
 
         Ok(())
     }
@@ -616,9 +620,11 @@ impl LsmTreeInner {
     /// Returns a level which is overfull
     pub fn choose_level_to_compact(&self) -> Option<usize> {
         // Counts the number of sstables at each level
-        let mut count = vec![0; 20]; // TODO: max levels assumed
+        let mut count = vec![0; 50]; // TODO: max levels assumed
+        let mut max_level : usize = 0;
         for slab in &self.slabs {
             count[slab.level] += 1;
+            max_level = max(max_level, slab.level);
         }
 
         // Finds the lowest level that's too big
@@ -627,7 +633,7 @@ impl LsmTreeInner {
         }
         else {
             let mut max_size = self.options.level1_size;
-            for i in 1..count.len() {
+            for i in 1..(max_level+1) {
                 if count[i] > max_size {
                     return Some(i);
                 }
@@ -758,7 +764,7 @@ impl LsmTreeInner {
     }
 }
 
-struct LsmTree {
+pub struct LsmTree {
     tree: Arc<RwLock<LsmTreeInner>>,
     should_compact: bool,
 }
@@ -773,17 +779,20 @@ impl LsmTree {
         Self{tree: tree, should_compact: should_compact}
     }
 
-    pub fn set(&mut self, key: &str, value: &str) {
+    pub fn set(&mut self, key: &str, value: &str) -> Result<(), io::Error>{
         // TODO: `set` mostly just needs a write lock to the memtable
         let mut g = self.tree.write().unwrap();
         (*g).set(key, value);
 
-        if g.options.start_compaction_thread && g.map.len() >= g.options.memtable_len {
-            g.flush();
+        if g.options.start_compaction_thread &&
+            g.memtable_size >= g.options.sstable_size * 1024
+        {
+            g.flush()?;
         }
+        Ok(())
     }
 
-    pub fn get(&self, key: &str) -> Option<String> {
+    pub fn get(&self, key: &str) -> Result<Option<String>, io::Error> {
         let g = self.tree.read().unwrap();
         g.get(key)
     }
@@ -812,6 +821,8 @@ impl LsmTree {
                 Some(level) => level,
             };
 
+            println!("Going to compact level {}", level_to_compact);
+
             let (target, overlaps) = tree.select_compaction_targets(level_to_compact);
             let new_slabs = tree.prepare_compaction(&target, &overlaps)?;
 
@@ -830,7 +841,7 @@ impl LsmTree {
     // We want a reader lock on the slabs for `get`
     // Need a writer lock on the memtable for `put` and `compact0`
     // Need a writer lock on the slabs for part of `compact`
-    pub fn start_compaction_thread(mutex: Arc<RwLock<LsmTreeInner>>) {
+    fn start_compaction_thread(mutex: Arc<RwLock<LsmTreeInner>>) {
         thread::spawn(move || {
             loop {
                 let compacted = {
@@ -845,7 +856,7 @@ impl LsmTree {
 
                 thread::sleep(Duration::from_millis(
                     if compacted { 10 }
-                    else { 250 }
+                    else { println!("long sleep"); 250 }
                 ));
             }
         });
@@ -874,8 +885,8 @@ mod tests {
     #[test]
     fn sanity_single_put_get() {
         let (dir, mut tree) = create_temp_db().unwrap();
-        tree.set("foo", "bar");
-        assert_eq!(tree.get("foo"), Some("bar".to_string()));
+        tree.set("foo", "bar").unwrap();
+        assert_eq!(tree.get("foo").unwrap(), Some("bar".to_string()));
     }
 
     #[test]
@@ -884,13 +895,13 @@ mod tests {
         {
             let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny());
             println!("Created temp dir {:?}", tmp_dir);
-            tree.set("foo", "bar");
+            tree.set("foo", "bar").unwrap();
             tree.flush().unwrap();
         }
 
         {
             let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
-            assert_eq!(tree.get("foo"), Some("bar".to_string()));
+            assert_eq!(tree.get("foo").unwrap(), Some("bar".to_string()));
         }
     }
 
@@ -901,12 +912,12 @@ mod tests {
         {
             let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny());
             println!("Created temp dir {:?}", tmp_dir);
-            tree.set("foo", "bar");
+            tree.set("foo", "bar").unwrap();
         }
 
         {
             let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
-            assert_eq!(tree.get("foo"), Some("bar".to_string()));
+            assert_eq!(tree.get("foo").unwrap(), Some("bar".to_string()));
         }
     }*/
 
@@ -914,10 +925,10 @@ mod tests {
     fn single_value_compact() -> Result<(), io::Error> {
         let (dir, mut tree) = create_temp_db().unwrap();
 
-        tree.set("foo", "bar");
+        tree.set("foo", "bar").unwrap();
         tree.flush().unwrap();
         tree.maybe_compact().unwrap();
-        assert_eq!(tree.get("foo"), Some("bar".to_string()));
+        assert_eq!(tree.get("foo").unwrap(), Some("bar".to_string()));
         Ok(())
     }
 
@@ -925,16 +936,16 @@ mod tests {
     fn double_compact() {
         let (dir, mut tree) = create_temp_db().unwrap();
 
-        tree.set("foo", "valfoo");
+        tree.set("foo", "valfoo").unwrap();
         tree.flush().unwrap();
         tree.set("bar", "valbar");
 
-        assert_eq!(tree.get("foo"), Some("valfoo".to_string()), "after 1 compact");
-        assert_eq!(tree.get("bar"), Some("valbar".to_string()), "after 1 compact");
+        assert_eq!(tree.get("foo").unwrap(), Some("valfoo".to_string()), "after 1 compact");
+        assert_eq!(tree.get("bar").unwrap(), Some("valbar".to_string()), "after 1 compact");
 
         tree.flush().unwrap();
-        assert_eq!(tree.get("foo"), Some("valfoo".to_string()), "after 2 compacts");
-        assert_eq!(tree.get("bar"), Some("valbar".to_string()), "after 2 compacts");
+        assert_eq!(tree.get("foo").unwrap(), Some("valfoo".to_string()), "after 2 compacts");
+        assert_eq!(tree.get("bar").unwrap(), Some("valbar".to_string()), "after 2 compacts");
 
         dir.close().unwrap();
     }
@@ -1040,7 +1051,7 @@ mod tests {
 
         let mut num_compactions : usize = 0;
         for (i, key) in keys.iter().enumerate() {
-            tree.set(key, &format!("x_{}", key));
+            tree.set(key, &format!("x_{}", key)).unwrap();
             if (i + 1) % 10 == 0 {
                 tree.flush().unwrap();
                 while tree.maybe_compact().unwrap() {
@@ -1055,7 +1066,7 @@ mod tests {
 
         for key in keys {
             let value = format!("x_{}", key);
-            assert_eq!(tree.get(&key), Some(value));
+            assert_eq!(tree.get(&key).unwrap(), Some(value));
         }
 
         assert!(num_compactions > 2);  // Checks that any compactions happened
