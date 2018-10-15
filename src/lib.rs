@@ -6,22 +6,23 @@ extern crate tempfile;
 extern crate uuid;
 extern crate owning_ref;
 
+use std::cmp::max;
 use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::path::PathBuf;
-use std::io;
 use std::fs;
+use std::io;
 use std::io::{Read, Write, Seek, SeekFrom};
 use std::io::ErrorKind::UnexpectedEof;
-use std::cmp::max;
+use std::path::Path;
+use std::path::PathBuf;
 use std::str;
-use std::marker::PhantomData;
-use owning_ref::OwningHandle;
+use std::sync::{Arc, Mutex, RwLock};
+use std::thread;
+use std::time::Duration;
 
 use byteorder::*;
-
 use byteorder::LittleEndian as Endian;
+use owning_ref::OwningHandle;
 
 
 const SSTABLE_SIGNATURE : &'static str = "SSTB";
@@ -333,27 +334,39 @@ impl Iterator for SSTableChainer {
 }
 
 pub struct Options {
+    /// Max length of the memtable
+    memtable_len: usize,
+
+    /// Target size of an sstable in kb
     sstable_size: usize,
+
+    /// Max sstables in level0 and level1
     level0_size: usize,
     level1_size: usize,
     level_size_factor: usize,
+
+    start_compaction_thread: bool,
 }
 
 impl Options {
     pub fn default() -> Options {
-        Options{sstable_size: 4096,
+        Options{memtable_len: 256,
+                sstable_size: 4096,
                 level0_size: 4,
                 level1_size: 10,
-                level_size_factor: 10}
+                level_size_factor: 10,
+                start_compaction_thread: true}
     }
 
     // Options for testing; makes everything tiny so compactions are more
     // serious.
     pub fn tiny() -> Options {
-        Options{sstable_size: 1,
+        Options{memtable_len: 8,  // Irrelevent since we don't compact automatically here
+                sstable_size: 1,
                 level0_size: 2,
                 level1_size: 4,
-                level_size_factor: 2}
+                level_size_factor: 2,
+                start_compaction_thread: false}
     }
 }
 
@@ -440,7 +453,7 @@ impl<Namer> SSTableStreamWriter<Namer>
     }
 }
 
-pub struct LsmTree {
+struct LsmTreeInner {
     path: PathBuf,
     options: Options,
     map: BTreeMap<String, String>,
@@ -454,12 +467,12 @@ enum Which {
     BothNext,
 }
 
-impl LsmTree {
-    pub fn new(path: &Path, options: Options) -> LsmTree {
-        let mut tree = LsmTree{ path: path.to_path_buf(),
-                                options: options,
-                                map: BTreeMap::new(),
-                                slabs: Vec::new(), };
+impl LsmTreeInner {
+    fn new(path: &Path, options: Options) -> Self {
+        let mut tree = Self{ path: path.to_path_buf(),
+                             options: options,
+                             map: BTreeMap::new(),
+                             slabs: Vec::new(), };
         tree.load_metadata();
         tree
     }
@@ -513,6 +526,7 @@ impl LsmTree {
             file.write_varstring(&slab.filename)?;
         }
 
+        file.sync_all()?;
         drop(file);  // Flush
         fs::rename(temppath, self.path.join("METADATA"));
         Ok(())
@@ -599,9 +613,8 @@ impl LsmTree {
         target.to_owned()
     }
 
-    pub fn maybe_compact(&mut self) -> Result<bool, io::Error> {
-        // TODO: lock
-
+    /// Returns a level which is overfull
+    pub fn choose_level_to_compact(&self) -> Option<usize> {
         // Counts the number of sstables at each level
         let mut count = vec![0; 20]; // TODO: max levels assumed
         for slab in &self.slabs {
@@ -609,119 +622,131 @@ impl LsmTree {
         }
 
         // Finds the lowest level that's too big
-        let mut level_to_compact : isize = -1;
         if count[0] > self.options.level0_size {
-            level_to_compact = 0;
+            return Some(0);
         }
         else {
             let mut max_size = self.options.level1_size;
             for i in 1..count.len() {
                 if count[i] > max_size {
-                    level_to_compact = i as isize;
-                    break;
+                    return Some(i);
                 }
                 max_size *= self.options.level_size_factor;
             }
         }
 
-        // Compacts this level
-        if level_to_compact < 0 {
-            Ok(false)
-        }
-        else {
-            // Picks a target SSTable to compact
-            let target = self.get_target_slab(level_to_compact as usize);
+        None
+    }
 
-            // Sets up iteration over the target sstable to merge from
-            let target_sstable = SSTable::open(&self.path.join(&target.filename))?;
-            let mut iter_target = target_sstable.iter().peekable();
+    /// Returns an SSTable at the current level and its overlaps that would make
+    /// up a single compaction step.
+    fn select_compaction_targets(&self, level_to_compact: usize) ->
+        (SlabInfo, Vec<SlabInfo>)
+    {
+        // Picks a target SSTable to compact
+        let target = self.get_target_slab(level_to_compact as usize);
 
-            // Finds the SSTables to merge the target with
-            let overlaps : Vec<SlabInfo> = {
-                let mut overlaps : Vec<&SlabInfo> = self.slabs.iter()
-                    .filter(|s|
-                            s.level == target.level + 1 &&
-                            target.overlaps(s))
-                    .collect();
-                overlaps.sort_unstable_by_key(|s| &s.key_min);
-                let overlaps : Vec<SlabInfo> = overlaps.drain(..).map(|s| s.clone()).collect();
-                overlaps
-            };
-            let overlaps_paths = overlaps.iter().map(
-                |info| self.path.join(&info.filename)).collect();
-            let mut iter_overlaps = SSTableChainer::new(overlaps_paths)?.peekable();
+        // Finds the SSTables to merge the target with
+        let overlaps : Vec<SlabInfo> = {
+            let mut overlaps : Vec<&SlabInfo> = self.slabs.iter()
+                .filter(|s|
+                        s.level == target.level + 1 &&
+                        target.overlaps(s))
+                .collect();
+            overlaps.sort_unstable_by_key(|s| &s.key_min);
+            let overlaps : Vec<SlabInfo> = overlaps.drain(..).map(|s| s.clone()).collect();
+            overlaps
+        };
 
-            let new_slabs = {
-                // Output streamer
-                let mut streamer = SSTableStreamWriter::new(
-                    &self.path,
-                    target.level + 1,
-                    || self.new_slab_filename(target.level + 1),
-                    self.options.sstable_size * 1024)?;
+        (target, overlaps)
+    }
 
-                // Here we go.  We will...
-                // .. merge iter_target and iter_overlaps
-                // .. into streamer
-                // .. doing bookkeeping in new_slabs
+    /// Writes the files for the compaction.
+    fn prepare_compaction(&self, target: &SlabInfo, overlaps: &Vec<SlabInfo>) ->
+        Result<Vec<SlabInfo>, io::Error>
+    {
+        // Sets up iteration over the target sstable to merge from
+        let target_sstable = SSTable::open(&self.path.join(&target.filename))?;
+        let mut iter_target = target_sstable.iter().peekable();
 
-                loop {
-                    use self::Which::*;
-                    let which = match (iter_target.peek(), iter_overlaps.peek()) {
-                        (None, None) => Finished,
-                        (Some(_), None) => TargetNext,
-                        (None, Some(_)) => OverlapsNext,
-                        (Some(Err(_)), _) => TargetNext, // Force error below
-                        (_, Some(Err(_))) => OverlapsNext, // Force error below
-                        (Some(Ok(target)), Some(Ok(overlap))) => {
-                            if target.0 == overlap.0 { BothNext }
-                            else if target.0 < overlap.0 { TargetNext }
-                            else { OverlapsNext }
-                        },
-                    };
+        // Sets up iteration over the overlaps
+        let overlaps_paths = overlaps.iter().map(
+            |info| self.path.join(&info.filename)).collect();
+        let mut iter_overlaps = SSTableChainer::new(overlaps_paths)?.peekable();
 
-                    match which {
-                        TargetNext => {
-                            let record = iter_target.next().unwrap()?;
-                            streamer.add(&record.0, &record.1)?;
-                        },
-                        OverlapsNext => {
-                            let record = iter_overlaps.next().unwrap()?;
-                            streamer.add(&record.0, &record.1)?;
-                        },
-                        BothNext => {
-                            let record = iter_target.next().unwrap()?;
-                            streamer.add(&record.0, &record.1)?;
-                            iter_overlaps.next().unwrap()?;  // Drop
-                        },
-                        Finished => break
-                    }
-                }
-                streamer.finish()?
+        // Output streamer
+        let mut streamer = SSTableStreamWriter::new(
+            &self.path,
+            target.level + 1,
+            || self.new_slab_filename(target.level + 1),
+            self.options.sstable_size * 1024)?;
+
+        // Here we go.  We will...
+        // .. merge iter_target and iter_overlaps
+        // .. into streamer
+        // .. doing bookkeeping in new_slabs
+
+        loop {
+            use self::Which::*;
+            let which = match (iter_target.peek(), iter_overlaps.peek()) {
+                (None, None) => Finished,
+                (Some(_), None) => TargetNext,
+                (None, Some(_)) => OverlapsNext,
+                (Some(Err(_)), _) => TargetNext, // Force error below
+                (_, Some(Err(_))) => OverlapsNext, // Force error below
+                (Some(Ok(target)), Some(Ok(overlap))) => {
+                    if target.0 == overlap.0 { BothNext }
+                    else if target.0 < overlap.0 { TargetNext }
+                    else { OverlapsNext }
+                },
             };
 
-            // Merging done.  Updates our records of the current SSTables
-
-            let mut slabs_to_remove : HashSet<&str> = HashSet::new();
-            slabs_to_remove.insert(&target.filename);
-            for slab in &overlaps {
-                slabs_to_remove.insert(&slab.filename);
+            match which {
+                TargetNext => {
+                    let record = iter_target.next().unwrap()?;
+                    streamer.add(&record.0, &record.1)?;
+                },
+                OverlapsNext => {
+                    let record = iter_overlaps.next().unwrap()?;
+                    streamer.add(&record.0, &record.1)?;
+                },
+                BothNext => {
+                    let record = iter_target.next().unwrap()?;
+                    streamer.add(&record.0, &record.1)?;
+                    iter_overlaps.next().unwrap()?;  // Drop
+                },
+                Finished => break
             }
-
-            // Rewrites the metadata
-            // TODO: lock
-            self.slabs.retain(|s| !slabs_to_remove.contains(s.filename.as_str()));
-            self.slabs.extend(new_slabs);
-            self.flush_metadata()?;
-
-            // Deletes old SSTables
-            for filename in slabs_to_remove {
-                let path = self.path.join(filename);
-                assert!(path.exists());
-                fs::remove_file(path)?;
-            }
-
-            Ok(true)
         }
+        let new_slabs = streamer.finish()?;
+        Ok(new_slabs)
+    }
+
+    /// Commits the results of `prepare_compaction`
+    fn commit_compaction(&mut self,
+                         target: SlabInfo,
+                         overlaps: Vec<SlabInfo>,
+                         new_slabs: Vec<SlabInfo>) ->
+        Result<(), io::Error>
+    {
+        let mut slabs_to_remove : HashSet<&str> = HashSet::new();
+        slabs_to_remove.insert(&target.filename);
+        for slab in &overlaps {
+            slabs_to_remove.insert(&slab.filename);
+        }
+
+        // Rewrites the metadata
+        self.slabs.retain(|s| !slabs_to_remove.contains(s.filename.as_str()));
+        self.slabs.extend(new_slabs);
+        self.flush_metadata()?;
+
+        // Deletes old SSTables
+        for filename in slabs_to_remove {
+            let path = self.path.join(filename);
+            assert!(path.exists());
+            fs::remove_file(path)?;
+        }
+        Ok(())
     }
 
     pub fn dump_metadata(&self) {
@@ -733,8 +758,103 @@ impl LsmTree {
     }
 }
 
-fn main() {
-    println!("Hello, world!");
+struct LsmTree {
+    tree: Arc<RwLock<LsmTreeInner>>,
+    should_compact: bool,
+}
+
+impl LsmTree {
+    pub fn new(path: &Path, options: Options) -> Self {
+        let should_compact = options.start_compaction_thread;
+        let tree = Arc::new(RwLock::new(LsmTreeInner::new(path, options)));
+        if should_compact {
+            Self::start_compaction_thread(tree.clone());
+        }
+        Self{tree: tree, should_compact: should_compact}
+    }
+
+    pub fn set(&mut self, key: &str, value: &str) {
+        // TODO: `set` mostly just needs a write lock to the memtable
+        let mut g = self.tree.write().unwrap();
+        (*g).set(key, value);
+
+        if g.options.start_compaction_thread && g.map.len() >= g.options.memtable_len {
+            g.flush();
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<String> {
+        let g = self.tree.read().unwrap();
+        g.get(key)
+    }
+
+    /// Flushes the current memtable to a new slab in level0
+    pub fn flush(&mut self) -> Result<(), io::Error> {
+        let mut g = self.tree.write().unwrap();
+        g.flush()
+    }
+
+    /// Just a convenience function for testing. Typically you should let the
+    /// internal thread handle compactions.
+    pub fn maybe_compact(&mut self) -> Result<bool, io::Error> {
+        Self::maybe_compact_internal(&self.tree)
+    }
+
+    // Needs to be a static function so it can be called from the compaction
+    // thread.
+    fn maybe_compact_internal(lock: &RwLock<LsmTreeInner>) -> Result<bool, io::Error> {
+        let (target, overlaps, new_slabs) = {
+            // Only need a read-lock to set up the compaction
+            let tree = lock.read().unwrap();
+
+            let level_to_compact = match tree.choose_level_to_compact() {
+                None => return Ok(false),  // No compaction needed
+                Some(level) => level,
+            };
+
+            let (target, overlaps) = tree.select_compaction_targets(level_to_compact);
+            let new_slabs = tree.prepare_compaction(&target, &overlaps)?;
+
+            (target, overlaps, new_slabs)
+        };
+
+        // Need a write-lock to commit the compaction
+        let mut tree = lock.write().unwrap();
+        tree.commit_compaction(target, overlaps, new_slabs)?;
+
+        Ok(true)
+    }
+
+    // What do we need to do?
+    //
+    // We want a reader lock on the slabs for `get`
+    // Need a writer lock on the memtable for `put` and `compact0`
+    // Need a writer lock on the slabs for part of `compact`
+    pub fn start_compaction_thread(mutex: Arc<RwLock<LsmTreeInner>>) {
+        thread::spawn(move || {
+            loop {
+                let compacted = {
+                    match Self::maybe_compact_internal(&mutex) {
+                        Ok(c) => c,
+                        Err(err) => {
+                            // TODO: Store error so next API call receives it
+                            panic!("Failure during compaction: {:?}", err);
+                        }
+                    }
+                };
+
+                thread::sleep(Duration::from_millis(
+                    if compacted { 10 }
+                    else { 250 }
+                ));
+            }
+        });
+    }
+
+    pub fn dump_metadata(&self) {
+        let g = self.tree.write().unwrap();
+        g.dump_metadata()
+    }
 }
 
 #[cfg(test)]
@@ -916,7 +1036,7 @@ mod tests {
 
         // Random data
         let mut rng = make_seeded_rng::<IsaacRng>(53335);
-        let mut keys = make_random_keys(&mut rng, 1000);
+        let mut keys = make_random_keys(&mut rng, 300);
 
         let mut num_compactions : usize = 0;
         for (i, key) in keys.iter().enumerate() {
@@ -937,5 +1057,7 @@ mod tests {
             let value = format!("x_{}", key);
             assert_eq!(tree.get(&key), Some(value));
         }
+
+        assert!(num_compactions > 2);  // Checks that any compactions happened
     }
 }
