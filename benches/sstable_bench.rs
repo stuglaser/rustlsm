@@ -70,5 +70,28 @@ fn criterion_benchmark(c: &mut Criterion) {
     c.bench_function("sstable.get", move |b| b.iter(|| sstable.get(&keys[n]).unwrap()));
 }
 
-criterion_group!(benches, criterion_benchmark);
+fn build_one_sstable(keys: &Vec<String>) {
+    // Creates the SSTable
+    let file = NamedTempFile::new().unwrap();
+
+    let mut builder = SSTableBuilder::create(file.path()).unwrap();
+    for k in keys {
+        builder.add(k, &format!("xx_{}", k)).unwrap();
+    }
+    builder.finish().unwrap();
+    drop(builder);
+}
+
+fn sstable_write_benchmark(c: &mut Criterion) {
+    // Random data
+    let mut rng = make_seeded_rng::<IsaacRng>(53335);
+    let mut keys = make_random_keys(&mut rng, 1000);
+    keys.sort();
+
+    c.bench_function("sstable.builder", move |b| b.iter(
+        || build_one_sstable(&keys)
+    ));
+}
+
+criterion_group!(benches, criterion_benchmark, sstable_write_benchmark);
 criterion_main!(benches);

@@ -94,7 +94,7 @@ fn read_record(file: &mut fs::File) -> Option<Result<(String, String), io::Error
     Some(read_rest_of_record(file, keylen))
 }
 
-fn write_record(file: &mut fs::File, key: &str, value: &str)
+fn write_record<W: Write>(file: &mut W, key: &str, value: &str)
                 -> Result<usize, io::Error> {
     let keybytes = key.as_bytes();
     let valuebytes = value.as_bytes();
@@ -102,8 +102,7 @@ fn write_record(file: &mut fs::File, key: &str, value: &str)
     file.write_u32::<Endian>(valuebytes.len() as u32)?;
     file.write_all(keybytes)?;
     file.write_all(valuebytes)?;
-    //Ok((4 + 4 + keybytes.len() + valuebytes.len()))
-    Ok((4 + 4 + keybytes.len() + valuebytes.len() + 4 + keybytes.len()))
+    Ok((4 + 4 + keybytes.len() + valuebytes.len()))
 }
 
 impl<'a> SSTableIter<'a> {
@@ -205,32 +204,39 @@ impl SSTable {
 }
 
 pub struct SSTableBuilder {
-    file: fs::File,
+    file: Box<BufWriter<fs::File>>,  // TODO: unnecessarily specific types
     index: Vec<(String, u64)>,
-    estimated_size_bytes: usize,
+    bytes_written: usize,
+    estimated_total_bytes: usize,
     finished: bool,
 }
 
 impl SSTableBuilder {
     pub fn create(path: &Path) -> Result<SSTableBuilder, io::Error> {
+        let writer = Box::new(
+            BufWriter::with_capacity(32*1024, fs::File::create(path)?));
         Ok(SSTableBuilder{
-            file: fs::File::create(path)?,
+            file: writer,
             index: Vec::new(),
-            estimated_size_bytes: 0,
+            bytes_written: 0,
+            estimated_total_bytes: 0,
             finished: false})
     }
 
     pub fn add(&mut self, key: &str, value: &str) -> Result<(), io::Error> {
         assert!(!self.finished);
-        let loc = self.file.seek(SeekFrom::Current(0))?;
+        let loc = self.bytes_written as u64;
+        //assert_eq!(loc, self.file.seek(SeekFrom::Current(0))?); // TODO: remove
+
         self.index.push((key.to_string(), loc));
         let bytes = write_record(&mut self.file, key, value)?;
-        self.estimated_size_bytes += bytes;
+        self.bytes_written += bytes;
+        self.estimated_total_bytes += (bytes + 4 + key.len() + 8);
         Ok(())
     }
 
-    pub fn bytes_written(&self) -> usize {
-        self.estimated_size_bytes
+    pub fn estimated_total_size(&self) -> usize {
+        self.estimated_total_bytes
     }
 
     pub fn finish(&mut self) -> Result<(), io::Error> {
@@ -249,6 +255,7 @@ impl SSTableBuilder {
         self.file.write_all(SSTABLE_SIGNATURE.as_bytes())?;
         self.file.write_u64::<Endian>(self.index.len() as u64)?;
         self.file.write_u64::<Endian>(index_loc as u64)?;
+        self.file.flush()?;
 
         self.finished = true;
         Ok(())
@@ -432,7 +439,7 @@ impl<Namer> SSTableStreamWriter<Namer>
 
     pub fn add(&mut self, key: &str, value: &str) -> Result<(), io::Error> {
         //println!("{} vs {}  into {}", self.current_builder.bytes_written(), self.size_threshold, self.current_filename);
-        if self.current_builder.bytes_written() > self.size_threshold {
+        if self.current_builder.estimated_total_size() >= self.size_threshold {
             self.finalize_current_sstable()?;
 
             // Creates a new SSTable
@@ -479,9 +486,9 @@ impl LsmTreeInner {
     fn set(&mut self, key: &str, value: &str) {
         self.map.insert(key.to_string(), value.to_string());
 
-        // Very rough estimate of memtable size. Doesn't currently include the
-        // size of the index of the sstable.
-        self.memtable_size += (key.len() + value.len());
+        // Very rough estimate of memtable size, including the expected SSTable
+        // index size.
+        self.memtable_size += (2 * key.len() + value.len() + 4 + 4 + 8);
     }
 
     fn get(&self, key: &str) -> Result<Option<String>, io::Error> {
