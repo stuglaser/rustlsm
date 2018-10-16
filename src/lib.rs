@@ -1,4 +1,4 @@
-#![allow(dead_code, unused)]
+//#![allow(dead_code, unused)]
 
 extern crate byteorder;
 extern crate rand;
@@ -11,12 +11,11 @@ use std::collections::BTreeMap;
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
-use std::io::{Read, Write, BufWriter, Seek, SeekFrom};
-use std::io::ErrorKind::UnexpectedEof;
+use std::io::{Read, Write, BufReader, BufWriter, Seek, SeekFrom};
 use std::path::Path;
 use std::path::PathBuf;
 use std::str;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::Duration;
 
@@ -26,6 +25,7 @@ use owning_ref::OwningHandle;
 
 
 const SSTABLE_SIGNATURE : &'static str = "SSTB";
+const SSTABLE_RW_BUFFER_SIZE : usize = 32*1024;
 
 /// Helpers for IO on strings with lengths
 trait VarStringIO {
@@ -56,16 +56,14 @@ pub struct SSTable {
 }
 
 pub struct SSTableIter<'a> {
-    file: fs::File,
+    file: BufReader<fs::File>,
     sstable: &'a SSTable,
     loc: u64,
 }
 
-// Reads everything but keylen from the record. This is kind of silly, it just
-// exists to help the error handling, so UnexpectedEof can be caught for just
-// the first thing we read from the record.
-fn read_rest_of_record(file: &mut fs::File, keylen: usize)
-                       -> Result<(String, String), io::Error> {
+// Reads a record at the current location
+fn read_record<R: Read>(file: &mut R) -> Result<(String, String), io::Error> {
+    let keylen = file.read_u32::<Endian>()? as usize;
     let valuelen = file.read_u32::<Endian>()? as usize;
 
     let mut keybuf = vec![0 as u8; keylen];
@@ -79,21 +77,6 @@ fn read_rest_of_record(file: &mut fs::File, keylen: usize)
     Ok((key, value))
 }
 
-// Reads a record.  Returns None on EOF
-fn read_record(file: &mut fs::File) -> Option<Result<(String, String), io::Error>> {
-    let keylen = match file.read_u32::<Endian>() {
-        Ok(len) => len as usize,
-        Err(err) => {
-            if err.kind() == UnexpectedEof {
-                return None
-            }
-            return Some(Err(err));
-        }
-    };
-
-    Some(read_rest_of_record(file, keylen))
-}
-
 fn write_record<W: Write>(file: &mut W, key: &str, value: &str)
                 -> Result<usize, io::Error> {
     let keybytes = key.as_bytes();
@@ -102,7 +85,7 @@ fn write_record<W: Write>(file: &mut W, key: &str, value: &str)
     file.write_u32::<Endian>(valuebytes.len() as u32)?;
     file.write_all(keybytes)?;
     file.write_all(valuebytes)?;
-    Ok((4 + 4 + keybytes.len() + valuebytes.len()))
+    Ok(4 + 4 + keybytes.len() + valuebytes.len())
 }
 
 impl<'a> SSTableIter<'a> {
@@ -120,19 +103,7 @@ impl<'a> Iterator for SSTableIter<'a> {
         }
 
         self.loc += 1;
-        match read_record(&mut self.file) {
-            None => {
-                //self.done = true;
-                //None
-                panic!("I don't think this should happen anymore");
-            },
-            Some(Ok(x)) => Some(Ok(x)),
-            Some(Err(err)) => {
-                //self.done = true;
-                self.loc = self.sstable.size;
-                Some(Err(err))
-            }
-        }
+        Some(read_record(&mut self.file))
     }
 }
 
@@ -148,11 +119,11 @@ impl SSTable {
     }
 
     fn preload(&mut self) -> Result<(), io::Error> {
-        let mut file = fs::File::open(&self.path)?;
+        let mut file = BufReader::with_capacity(SSTABLE_RW_BUFFER_SIZE,
+                                                fs::File::open(&self.path)?);
 
         // Reads the footer
         file.seek(SeekFrom::End(-20))?;
-        let footer_loc = file.seek(SeekFrom::Current(0))?;
 
         // Reads the signature
         let mut signature = [0; 4];
@@ -180,7 +151,9 @@ impl SSTable {
     }
 
     pub fn iter<'a>(&'a self) -> SSTableIter {
-        let mut file = fs::File::open(&self.path).unwrap();
+        let file = BufReader::with_capacity(
+            SSTABLE_RW_BUFFER_SIZE,
+            fs::File::open(&self.path).unwrap());
         SSTableIter::<'a>{file: file,
                           sstable: self,
                           loc: 0}
@@ -193,8 +166,8 @@ impl SSTable {
         };
 
         let mut file = fs::File::open(&self.path)?;
-        file.seek(SeekFrom::Start(loc));
-        let (key, value) = read_record(&mut file).unwrap()?;
+        file.seek(SeekFrom::Start(loc))?;
+        let (_key, value) = read_record(&mut file)?;
         Ok(Some(value))
     }
 
@@ -214,7 +187,8 @@ pub struct SSTableBuilder {
 impl SSTableBuilder {
     pub fn create(path: &Path) -> Result<SSTableBuilder, io::Error> {
         let writer = Box::new(
-            BufWriter::with_capacity(32*1024, fs::File::create(path)?));
+            BufWriter::with_capacity(SSTABLE_RW_BUFFER_SIZE,
+                                     fs::File::create(path)?));
         Ok(SSTableBuilder{
             file: writer,
             index: Vec::new(),
@@ -231,7 +205,7 @@ impl SSTableBuilder {
         self.index.push((key.to_string(), loc));
         let bytes = write_record(&mut self.file, key, value)?;
         self.bytes_written += bytes;
-        self.estimated_total_bytes += (bytes + 4 + key.len() + 8);
+        self.estimated_total_bytes += bytes + 4 + key.len() + 8;
         Ok(())
     }
 
@@ -249,7 +223,7 @@ impl SSTableBuilder {
             self.file.write_u64::<Endian>(*loc)?;
         }
 
-        let footer_loc = self.file.seek(SeekFrom::Current(0))?;
+        self.file.seek(SeekFrom::Current(0))?;
 
         // Writes the footer
         self.file.write_all(SSTABLE_SIGNATURE.as_bytes())?;
@@ -269,7 +243,7 @@ impl SSTableBuilder {
 impl Drop for SSTableBuilder {
     fn drop(&mut self) {
         if !self.finished {
-            self.finish();
+            self.finish().unwrap();
         }
     }
 }
@@ -473,14 +447,14 @@ enum Which {
 }
 
 impl LsmTreeInner {
-    fn new(path: &Path, options: Options) -> Self {
+    fn new(path: &Path, options: Options) -> Result<Self, io::Error> {
         let mut tree = Self{ path: path.to_path_buf(),
                              options: options,
                              map: BTreeMap::new(),
                              memtable_size: 0,
                              slabs: Vec::new(), };
-        tree.load_metadata();
-        tree
+        tree.load_metadata()?;
+        Ok(tree)
     }
 
     fn set(&mut self, key: &str, value: &str) {
@@ -488,7 +462,7 @@ impl LsmTreeInner {
 
         // Very rough estimate of memtable size, including the expected SSTable
         // index size.
-        self.memtable_size += (2 * key.len() + value.len() + 4 + 4 + 8);
+        self.memtable_size += 2 * key.len() + value.len() + 4 + 4 + 8;
     }
 
     fn get(&self, key: &str) -> Result<Option<String>, io::Error> {
@@ -538,7 +512,7 @@ impl LsmTreeInner {
 
         file.sync_all()?;
         drop(file);  // Flush
-        fs::rename(temppath, self.path.join("METADATA"));
+        fs::rename(temppath, self.path.join("METADATA"))?;
         Ok(())
     }
 
@@ -578,8 +552,6 @@ impl LsmTreeInner {
         }
 
         // Specifies the new slab
-        use uuid::Uuid;
-        let uuid = Uuid::new_v4();
         let new_slab = SlabInfo{
             level: 0,
             key_min: self.map.keys().next().unwrap().to_string(),
@@ -773,17 +745,16 @@ impl LsmTreeInner {
 
 pub struct LsmTree {
     tree: Arc<RwLock<LsmTreeInner>>,
-    should_compact: bool,
 }
 
 impl LsmTree {
-    pub fn new(path: &Path, options: Options) -> Self {
+    pub fn new(path: &Path, options: Options) -> Result<Self, io::Error> {
         let should_compact = options.start_compaction_thread;
-        let tree = Arc::new(RwLock::new(LsmTreeInner::new(path, options)));
+        let tree = Arc::new(RwLock::new(LsmTreeInner::new(path, options)?));
         if should_compact {
             Self::start_compaction_thread(tree.clone());
         }
-        Self{tree: tree, should_compact: should_compact}
+        Ok(Self{tree: tree})
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), io::Error>{
@@ -884,14 +855,14 @@ mod tests {
 
     fn create_temp_db() -> Result<(TempDir, LsmTree), io::Error> {
         let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir()?;
-        let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+        let tree = LsmTree::new(tmp_dir.path(), Options::tiny())?;
         println!("Created temp dir {:?}", tmp_dir);
         return Result::Ok((tmp_dir, tree));
     }
 
     #[test]
     fn sanity_single_put_get() {
-        let (dir, mut tree) = create_temp_db().unwrap();
+        let (_dir, mut tree) = create_temp_db().unwrap();
         tree.set("foo", "bar").unwrap();
         assert_eq!(tree.get("foo").unwrap(), Some("bar".to_string()));
     }
@@ -900,14 +871,14 @@ mod tests {
     fn check_persists_single_key_flush() {
         let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir().unwrap();
         {
-            let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny()).unwrap();
             println!("Created temp dir {:?}", tmp_dir);
             tree.set("foo", "bar").unwrap();
             tree.flush().unwrap();
         }
 
         {
-            let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            let tree = LsmTree::new(tmp_dir.path(), Options::tiny()).unwrap();
             assert_eq!(tree.get("foo").unwrap(), Some("bar".to_string()));
         }
     }
@@ -930,7 +901,7 @@ mod tests {
 
     #[test]
     fn single_value_compact() -> Result<(), io::Error> {
-        let (dir, mut tree) = create_temp_db().unwrap();
+        let (_dir, mut tree) = create_temp_db().unwrap();
 
         tree.set("foo", "bar").unwrap();
         tree.flush().unwrap();
@@ -945,7 +916,7 @@ mod tests {
 
         tree.set("foo", "valfoo").unwrap();
         tree.flush().unwrap();
-        tree.set("bar", "valbar");
+        tree.set("bar", "valbar").unwrap();
 
         assert_eq!(tree.get("foo").unwrap(), Some("valfoo".to_string()), "after 1 compact");
         assert_eq!(tree.get("bar").unwrap(), Some("valbar".to_string()), "after 1 compact");
@@ -1009,7 +980,7 @@ mod tests {
         for k in &keys {
             builder.add(k, &format!("xx_{}", k)).unwrap();
         }
-        builder.finish();
+        builder.finish().unwrap();
 
         let mut sstable = SSTable::open(file.path()).unwrap();
         for k in &keys {
@@ -1022,9 +993,9 @@ mod tests {
         // Creates the SSTable
         let file = NamedTempFile::new().unwrap();
         let mut builder = SSTableBuilder::create(file.path()).unwrap();
-        builder.add("bar", "xbar");
-        builder.add("foo", "xfoo");
-        builder.finish();
+        builder.add("bar", "xbar").unwrap();
+        builder.add("foo", "xfoo").unwrap();
+        builder.finish().unwrap();
 
         let mut sstable = SSTable::open(file.path()).unwrap();
         assert_eq!(sstable.get("abracadabra").unwrap(), None);
@@ -1042,7 +1013,7 @@ mod tests {
             let kv = format!("{}", ch);
             builder.add(&kv, &kv).unwrap();
         }
-        builder.finish();
+        builder.finish().unwrap();
 
         let mut sstable = SSTable::open(file.path()).unwrap();
         assert_eq!(sstable.len(), letters.len());
@@ -1050,11 +1021,11 @@ mod tests {
 
     #[test]
     fn check_for_compactions() {
-        let (dir, mut tree) = create_temp_db().unwrap();
+        let (_dir, mut tree) = create_temp_db().unwrap();
 
         // Random data
         let mut rng = make_seeded_rng::<IsaacRng>(53335);
-        let mut keys = make_random_keys(&mut rng, 300);
+        let keys = make_random_keys(&mut rng, 300);
 
         let mut num_compactions : usize = 0;
         for (i, key) in keys.iter().enumerate() {
