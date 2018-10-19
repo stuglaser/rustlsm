@@ -1,4 +1,4 @@
-//#![allow(dead_code, unused)]
+#![allow(dead_code, unused)]
 
 extern crate byteorder;
 extern crate rand;
@@ -12,8 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
 use std::io::{Read, Write, BufReader, BufWriter, Seek, SeekFrom};
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::str;
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -23,31 +22,14 @@ use byteorder::*;
 use byteorder::LittleEndian as Endian;
 use owning_ref::OwningHandle;
 
+mod wal;
+use wal::{WalReader, WalWriter};
+
+mod varstring;
+use varstring::{VarStringIORead, VarStringIOWrite};
 
 const SSTABLE_SIGNATURE : &'static str = "SSTB";
 const SSTABLE_RW_BUFFER_SIZE : usize = 32*1024;
-
-/// Helpers for IO on strings with lengths
-trait VarStringIO {
-    fn write_varstring(&mut self, s: &str) -> Result<(), io::Error>;
-    fn read_varstring(&mut self) -> Result<String, io::Error>;
-}
-impl VarStringIO for fs::File {
-    fn write_varstring(&mut self, s: &str) -> Result<(), io::Error> {
-        let bytes = s.as_bytes();
-        self.write_u32::<Endian>(bytes.len() as u32)?;
-        self.write_all(bytes)?;
-        Ok(())
-    }
-
-    fn read_varstring(&mut self) -> Result<String, io::Error> {
-        let len = self.read_u32::<Endian>()? as usize;
-
-        let mut buf = vec![0 as u8; len];
-        self.read_exact(&mut buf)?;
-        Ok(String::from_utf8(buf).unwrap())
-    }
-}
 
 pub struct SSTable {
     path: PathBuf,
@@ -200,7 +182,6 @@ impl SSTableBuilder {
     pub fn add(&mut self, key: &str, value: &str) -> Result<(), io::Error> {
         assert!(!self.finished);
         let loc = self.bytes_written as u64;
-        //assert_eq!(loc, self.file.seek(SeekFrom::Current(0))?); // TODO: remove
 
         self.index.push((key.to_string(), loc));
         let bytes = write_record(&mut self.file, key, value)?;
@@ -412,7 +393,6 @@ impl<Namer> SSTableStreamWriter<Namer>
     }
 
     pub fn add(&mut self, key: &str, value: &str) -> Result<(), io::Error> {
-        //println!("{} vs {}  into {}", self.current_builder.bytes_written(), self.size_threshold, self.current_filename);
         if self.current_builder.estimated_total_size() >= self.size_threshold {
             self.finalize_current_sstable()?;
 
@@ -745,22 +725,40 @@ impl LsmTreeInner {
 
 pub struct LsmTree {
     tree: Arc<RwLock<LsmTreeInner>>,
+    wal_writer: WalWriter,
 }
 
 impl LsmTree {
     pub fn new(path: &Path, options: Options) -> Result<Self, io::Error> {
         let should_compact = options.start_compaction_thread;
-        let tree = Arc::new(RwLock::new(LsmTreeInner::new(path, options)?));
+        let mut inner = LsmTreeInner::new(path, options)?;
+
+        // Recovers data from the WAL. This is currently brittle; since the WAL
+        // is only a single overwritten file, we must recover (and flush) before
+        // creating the WalWriter below.
+        for datum in WalReader::new(path)? {
+            let (_stamp, key, value) = datum?;
+            inner.set(&key, &value);
+        }
+        inner.flush()?;
+
+        let tree = Arc::new(RwLock::new(inner));
         if should_compact {
             Self::start_compaction_thread(tree.clone());
         }
-        Ok(Self{tree: tree})
+        Ok(Self{tree: tree, wal_writer: WalWriter::new(path)?})
+    }
+
+    fn nowstamp() -> Duration {
+        use std::time::SystemTime;
+        SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap()
     }
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), io::Error>{
-        // TODO: `set` mostly just needs a write lock to the memtable
+        let now = Self::nowstamp();
         let mut g = self.tree.write().unwrap();
         (*g).set(key, value);
+        self.wal_writer.add(&now, key, value)?;
 
         if g.options.start_compaction_thread &&
             g.memtable_size >= g.options.sstable_size * 1024
@@ -778,7 +776,8 @@ impl LsmTree {
     /// Flushes the current memtable to a new slab in level0
     pub fn flush(&mut self) -> Result<(), io::Error> {
         let mut g = self.tree.write().unwrap();
-        g.flush()
+        g.flush()?;
+        self.wal_writer.reset()
     }
 
     /// Just a convenience function for testing. Typically you should let the
@@ -883,21 +882,20 @@ mod tests {
         }
     }
 
-    /*  TODO: add back in when we implement WAL
     #[test]
     fn check_persists_single_key_noflush() {
         let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir().unwrap();
         {
-            let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            let mut tree = LsmTree::new(tmp_dir.path(), Options::tiny()).unwrap();
             println!("Created temp dir {:?}", tmp_dir);
             tree.set("foo", "bar").unwrap();
         }
 
         {
-            let tree = LsmTree::new(tmp_dir.path(), Options::tiny());
+            let tree = LsmTree::new(tmp_dir.path(), Options::tiny()).unwrap();
             assert_eq!(tree.get("foo").unwrap(), Some("bar".to_string()));
         }
-    }*/
+    }
 
     #[test]
     fn single_value_compact() -> Result<(), io::Error> {
@@ -1048,5 +1046,30 @@ mod tests {
         }
 
         assert!(num_compactions > 2);  // Checks that any compactions happened
+    }
+
+    #[test]
+    fn check_wal_works() {
+        use wal::{WalReader, WalWriter};
+        use std::time::Duration;
+        let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir().unwrap();
+        {
+            let mut writer = WalWriter::new(tmp_dir.path()).unwrap();
+
+            writer.add(&Duration::new(10, 0), "foo", "x_foo").unwrap();
+            writer.add(&Duration::new(20, 0), "bar", "x_bar").unwrap();
+        }
+
+        let mut reader = WalReader::new(tmp_dir.path()).unwrap();
+
+        let (dur, key, val) = reader.next().unwrap().unwrap();
+        assert_eq!(dur.as_secs(), 10);
+        assert_eq!(key, "foo");
+        assert_eq!(val, "x_foo");
+
+        let (dur, key, val) = reader.next().unwrap().unwrap();
+        assert_eq!(dur.as_secs(), 20);
+        assert_eq!(key, "bar");
+        assert_eq!(val, "x_bar");
     }
 }
