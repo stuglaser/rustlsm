@@ -117,3 +117,33 @@ impl Iterator for WalReader {
         Some(Ok((dur, key, value)))
     }
 }
+
+#[cfg(test)]
+mod test {
+    use tempfile::{NamedTempFile, Builder as TempDirBuilder, TempDir};
+
+    #[test]
+    fn check_wal_works() {
+        use wal::{WalReader, WalWriter};
+        use std::time::Duration;
+        let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir().unwrap();
+        {
+            let mut writer = WalWriter::new(tmp_dir.path()).unwrap();
+
+            writer.add(&Duration::new(10, 0), "foo", "x_foo").unwrap();
+            writer.add(&Duration::new(20, 0), "bar", "x_bar").unwrap();
+        }
+
+        let mut reader = WalReader::new(tmp_dir.path()).unwrap();
+
+        let (dur, key, val) = reader.next().unwrap().unwrap();
+        assert_eq!(dur.as_secs(), 10);
+        assert_eq!(key, "foo");
+        assert_eq!(val, "x_foo");
+
+        let (dur, key, val) = reader.next().unwrap().unwrap();
+        assert_eq!(dur.as_secs(), 20);
+        assert_eq!(key, "bar");
+        assert_eq!(val, "x_bar");
+    }
+}

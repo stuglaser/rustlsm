@@ -1,5 +1,4 @@
-use std::io::{self, Read, Write};
-//use std::fs;
+use std::io;
 
 extern crate byteorder;
 use byteorder::*;

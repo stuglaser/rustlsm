@@ -8,7 +8,7 @@ extern crate tempfile;
 use tempfile::NamedTempFile;
 
 extern crate rustlsm;
-use rustlsm::{SSTable, SSTableBuilder};
+use rustlsm::sstable::{SSTable, SSTableBuilder};
 
 // Borrowed from seed_from_u64, which will be in rand 0.5
 fn make_seeded_rng<T: SeedableRng>(mut state: u64) -> T {
