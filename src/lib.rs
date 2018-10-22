@@ -252,7 +252,7 @@ impl LsmTreeInner {
         Ok(())
     }
 
-    fn new_slab_filename(&self, level: usize) -> String {
+    fn new_slab_filename(level: usize) -> String {
         use uuid::Uuid;
         let uuid = Uuid::new_v4();
         format!("slab_l{:02}_{}.sst", level, uuid.to_hyphenated())
@@ -269,7 +269,7 @@ impl LsmTreeInner {
             level: 0,
             key_min: self.map.keys().next().unwrap().to_string(),
             key_max: self.map.keys().next_back().unwrap().to_string(),
-            filename: self.new_slab_filename(0) };
+            filename: Self::new_slab_filename(0) };
 
         // Writes the slab to disk
         let mut builder = SSTableBuilder::create(&self.path.join(&new_slab.filename))?;
@@ -360,24 +360,28 @@ impl LsmTreeInner {
     }
 
     /// Writes the files for the compaction.
-    fn prepare_compaction(&self, target: &SlabInfo, overlaps: &Vec<SlabInfo>) ->
+    //
+    // Needs to be a static function so we don't hold a lock on the tree while
+    // we merge files.
+    fn prepare_compaction(path: &Path, sstable_size: usize,
+                          target: &SlabInfo, overlaps: &Vec<SlabInfo>) ->
         Result<Vec<SlabInfo>, io::Error>
     {
         // Sets up iteration over the target sstable to merge from
-        let target_sstable = SSTable::open(&self.path.join(&target.filename))?;
+        let target_sstable = SSTable::open(&path.join(&target.filename))?;
         let mut iter_target = target_sstable.iter().peekable();
 
         // Sets up iteration over the overlaps
         let overlaps_paths = overlaps.iter().map(
-            |info| self.path.join(&info.filename)).collect();
+            |info| path.join(&info.filename)).collect();
         let mut iter_overlaps = SSTableChainer::new(overlaps_paths)?.peekable();
 
         // Output streamer
         let mut streamer = SSTableStreamWriter::new(
-            &self.path,
+            path,
             target.level + 1,
-            || self.new_slab_filename(target.level + 1),
-            self.options.sstable_size * 1024)?;
+            || Self::new_slab_filename(target.level + 1),
+            sstable_size * 1024)?;
 
         // Here we go.  We will...
         // .. merge iter_target and iter_overlaps
@@ -385,7 +389,7 @@ impl LsmTreeInner {
         // .. doing bookkeeping in new_slabs
 
         loop {
-            use self::Which::*;
+            use ::Which::*;
             let which = match (iter_target.peek(), iter_overlaps.peek()) {
                 (None, None) => Finished,
                 (Some(_), None) => TargetNext,
@@ -497,6 +501,7 @@ impl LsmTree {
             g.memtable_size >= g.options.sstable_size * 1024
         {
             g.flush()?;
+            self.wal_writer.reset()?;
         }
         Ok(())
     }
@@ -522,7 +527,7 @@ impl LsmTree {
     // Needs to be a static function so it can be called from the compaction
     // thread.
     fn maybe_compact_internal(lock: &RwLock<LsmTreeInner>) -> Result<bool, io::Error> {
-        let (target, overlaps, new_slabs) = {
+        let (path, sstable_size, target, overlaps) = {
             // Only need a read-lock to set up the compaction
             let tree = lock.read().unwrap();
 
@@ -534,14 +539,19 @@ impl LsmTree {
             println!("Going to compact level {}", level_to_compact);
 
             let (target, overlaps) = tree.select_compaction_targets(level_to_compact);
-            let new_slabs = tree.prepare_compaction(&target, &overlaps)?;
-
-            (target, overlaps, new_slabs)
+            (tree.path.clone(), tree.options.sstable_size, target, overlaps)
         };
 
+        // Merging the sstables must happen while the tree is unlocked so other
+        // operations can access the data.
+        let new_slabs = LsmTreeInner::prepare_compaction(
+            &path, sstable_size, &target, &overlaps)?;
+
         // Need a write-lock to commit the compaction
+        println!("Locking to commit compaction");
         let mut tree = lock.write().unwrap();
         tree.commit_compaction(target, overlaps, new_slabs)?;
+        println!("Compaction committed");
 
         Ok(true)
     }
