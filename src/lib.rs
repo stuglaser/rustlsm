@@ -13,7 +13,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::str;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -31,7 +31,7 @@ use sstable::{SSTable, SSTableBuilder, SSTableChainer};
 
 pub struct Options {
     /// Target size of an sstable in kb
-    sstable_size: usize,
+    sstable_size_kb: usize,
 
     /// Max sstables in level0 and level1
     level0_size: usize,
@@ -43,7 +43,7 @@ pub struct Options {
 
 impl Options {
     pub fn default() -> Options {
-        Options{sstable_size: 4096,
+        Options{sstable_size_kb: 4096,
                 level0_size: 4,
                 level1_size: 10,
                 level_size_factor: 10,
@@ -53,7 +53,7 @@ impl Options {
     // Options for testing; makes everything tiny so compactions are more
     // serious.
     pub fn tiny() -> Options {
-        Options{sstable_size: 1,
+        Options{sstable_size_kb: 1,
                 level0_size: 2,
                 level1_size: 4,
                 level_size_factor: 2,
@@ -150,6 +150,8 @@ struct LsmTreeInner {
     map: BTreeMap<String, String>,
     memtable_size: usize,  // Estimate of bytes of the memtable
     slabs: Vec<SlabInfo>,
+    // Caches the number of slabs in each level
+    cached_level_counts: Vec<usize>,
 }
 
 enum Which {
@@ -165,7 +167,8 @@ impl LsmTreeInner {
                              options: options,
                              map: BTreeMap::new(),
                              memtable_size: 0,
-                             slabs: Vec::new(), };
+                             slabs: Vec::new(),
+                             cached_level_counts: Vec::new()};
         tree.load_metadata()?;
         Ok(tree)
     }
@@ -226,6 +229,7 @@ impl LsmTreeInner {
         file.sync_all()?;
         drop(file);  // Flush
         fs::rename(temppath, self.path.join("METADATA"))?;
+        self.update_cached_level_counts();
         Ok(())
     }
 
@@ -249,7 +253,22 @@ impl LsmTreeInner {
         }
 
         self.slabs = slabs;
+        self.update_cached_level_counts();
         Ok(())
+    }
+
+    // It's important to call this every time the set of slabs changes.
+    fn update_cached_level_counts(&mut self) {
+        // Counts the number of sstables at each level
+        let mut count = vec![0; 50]; // TODO: max levels assumed
+        let mut max_level : usize = 0;
+        for slab in &self.slabs {
+            count[slab.level] += 1;
+            max_level = max(max_level, slab.level);
+        }
+
+        count.resize(max_level + 1, 0);
+        self.cached_level_counts = count;
     }
 
     fn new_slab_filename(level: usize) -> String {
@@ -311,29 +330,25 @@ impl LsmTreeInner {
 
     /// Returns a level which is overfull
     pub fn choose_level_to_compact(&self) -> Option<usize> {
-        // Counts the number of sstables at each level
-        let mut count = vec![0; 50]; // TODO: max levels assumed
-        let mut max_level : usize = 0;
-        for slab in &self.slabs {
-            count[slab.level] += 1;
-            max_level = max(max_level, slab.level);
+        let mut result = None;
+
+        // Finds the deepest level that's too big
+
+        if self.cached_level_counts[0] > self.options.level0_size {
+            result = Some(0);
         }
 
-        // Finds the lowest level that's too big
-        if count[0] > self.options.level0_size {
-            return Some(0);
-        }
-        else {
-            let mut max_size = self.options.level1_size;
-            for i in 1..(max_level+1) {
-                if count[i] > max_size {
-                    return Some(i);
-                }
-                max_size *= self.options.level_size_factor;
+        let mut max_size = self.options.level1_size;
+        for i in 1..self.cached_level_counts.len() {
+            if self.cached_level_counts[i] > max_size {
+                result = Some(i);
             }
+            max_size *= self.options.level_size_factor;
         }
 
-        None
+        //println!("Chose level {:?} to compact, sizes = {:?}", result, self.cached_level_counts);
+
+        result
     }
 
     /// Returns an SSTable at the current level and its overlaps that would make
@@ -363,7 +378,7 @@ impl LsmTreeInner {
     //
     // Needs to be a static function so we don't hold a lock on the tree while
     // we merge files.
-    fn prepare_compaction(path: &Path, sstable_size: usize,
+    fn prepare_compaction(path: &Path, sstable_size_kb: usize,
                           target: &SlabInfo, overlaps: &Vec<SlabInfo>) ->
         Result<Vec<SlabInfo>, io::Error>
     {
@@ -381,7 +396,7 @@ impl LsmTreeInner {
             path,
             target.level + 1,
             || Self::new_slab_filename(target.level + 1),
-            sstable_size * 1024)?;
+            sstable_size_kb * 1024)?;
 
         // Here we go.  We will...
         // .. merge iter_target and iter_overlaps
@@ -461,7 +476,9 @@ impl LsmTreeInner {
 }
 
 pub struct LsmTree {
-    tree: Arc<RwLock<LsmTreeInner>>,
+    tree: Arc<Mutex<LsmTreeInner>>,
+    stall_cond: Arc<Condvar>,  // Notified after compactions occur
+    compact_cond: Arc<Condvar>,  // Notified when slabs are added
     wal_writer: WalWriter,
 }
 
@@ -479,11 +496,18 @@ impl LsmTree {
         }
         inner.flush()?;
 
-        let tree = Arc::new(RwLock::new(inner));
+        let tree = Arc::new(Mutex::new(inner));
+        let stall_cond = Arc::new(Condvar::new());
+        let compact_cond = Arc::new(Condvar::new());
         if should_compact {
-            Self::start_compaction_thread(tree.clone());
+            Self::start_compaction_thread(tree.clone(),
+                                          stall_cond.clone(),
+                                          compact_cond.clone());
         }
-        Ok(Self{tree: tree, wal_writer: WalWriter::new(path)?})
+        Ok(Self{tree: tree,
+                stall_cond: stall_cond,
+                compact_cond: compact_cond,
+                wal_writer: WalWriter::new(path)?})
     }
 
     fn nowstamp() -> Duration {
@@ -493,27 +517,50 @@ impl LsmTree {
 
     pub fn set(&mut self, key: &str, value: &str) -> Result<(), io::Error>{
         let now = Self::nowstamp();
-        let mut g = self.tree.write().unwrap();
+        let mut g = self.tree.lock().unwrap();
+
+        // If this write will require a flush, we might need to stall
+        let will_need_flush = g.memtable_size >= g.options.sstable_size_kb * 1024;
+
+        // Stalls until there is room for this item.
+        if will_need_flush {
+            loop {
+                if g.cached_level_counts.get(0).unwrap_or(&0) <= &g.options.level0_size {
+                    // There is room for a level0 slab
+                    break;
+                }
+
+                if !g.options.start_compaction_thread {
+                    // TODO: This should return some sort of "Can not write" error,
+                    // but for now we just overfill the memtable.
+                    break;
+                }
+
+                // Waits for compactions to occur
+                g = self.stall_cond.wait(g).unwrap();
+            }
+        }
+
         (*g).set(key, value);
         self.wal_writer.add(&now, key, value)?;
 
-        if g.options.start_compaction_thread &&
-            g.memtable_size >= g.options.sstable_size * 1024
+        if g.options.start_compaction_thread && will_need_flush
         {
             g.flush()?;
             self.wal_writer.reset()?;
+            self.compact_cond.notify_one();
         }
         Ok(())
     }
 
     pub fn get(&self, key: &str) -> Result<Option<String>, io::Error> {
-        let g = self.tree.read().unwrap();
+        let g = self.tree.lock().unwrap();
         g.get(key)
     }
 
     /// Flushes the current memtable to a new slab in level0
     pub fn flush(&mut self) -> Result<(), io::Error> {
-        let mut g = self.tree.write().unwrap();
+        let mut g = self.tree.lock().unwrap();
         g.flush()?;
         self.wal_writer.reset()
     }
@@ -526,43 +573,40 @@ impl LsmTree {
 
     // Needs to be a static function so it can be called from the compaction
     // thread.
-    fn maybe_compact_internal(lock: &RwLock<LsmTreeInner>) -> Result<bool, io::Error> {
-        let (path, sstable_size, target, overlaps) = {
-            // Only need a read-lock to set up the compaction
-            let tree = lock.read().unwrap();
+    fn maybe_compact_internal(lock: &Mutex<LsmTreeInner>) -> Result<bool, io::Error> {
+        let (path, sstable_size_kb, target, overlaps) = {
+            // Locks to set up the compaction
+            let tree = lock.lock().unwrap();
 
             let level_to_compact = match tree.choose_level_to_compact() {
                 None => return Ok(false),  // No compaction needed
                 Some(level) => level,
             };
 
-            println!("Going to compact level {}", level_to_compact);
+            //println!("Going to compact level {}", level_to_compact);
 
             let (target, overlaps) = tree.select_compaction_targets(level_to_compact);
-            (tree.path.clone(), tree.options.sstable_size, target, overlaps)
+            (tree.path.clone(), tree.options.sstable_size_kb, target, overlaps)
         };
 
-        // Merging the sstables must happen while the tree is unlocked so other
+        // Merging the sstables should happen while the tree is unlocked so other
         // operations can access the data.
         let new_slabs = LsmTreeInner::prepare_compaction(
-            &path, sstable_size, &target, &overlaps)?;
+            &path, sstable_size_kb, &target, &overlaps)?;
 
-        // Need a write-lock to commit the compaction
-        println!("Locking to commit compaction");
-        let mut tree = lock.write().unwrap();
+        // Need a lock to commit the compaction
+        let mut tree = lock.lock().unwrap();
         tree.commit_compaction(target, overlaps, new_slabs)?;
-        println!("Compaction committed");
 
         Ok(true)
     }
 
-    // What do we need to do?
-    //
-    // We want a reader lock on the slabs for `get`
-    // Need a writer lock on the memtable for `put` and `compact0`
-    // Need a writer lock on the slabs for part of `compact`
-    fn start_compaction_thread(mutex: Arc<RwLock<LsmTreeInner>>) {
+    // Kicks off a thread to perform compaction in the background.
+    fn start_compaction_thread(mutex: Arc<Mutex<LsmTreeInner>>,
+                               stall_cond: Arc<Condvar>,
+                               compact_cond: Arc<Condvar>) {
         thread::spawn(move || {
+            let silly_mutex = Mutex::new(0);
             loop {
                 let compacted = {
                     match Self::maybe_compact_internal(&mutex) {
@@ -574,17 +618,41 @@ impl LsmTree {
                     }
                 };
 
-                thread::sleep(Duration::from_millis(
-                    if compacted { 10 }
-                    else { println!("long sleep"); 250 }
-                ));
+                if compacted {
+                    stall_cond.notify_all();
+                }
+                else {
+                    let silly_guard = silly_mutex.lock().unwrap();
+                    compact_cond.wait_timeout(
+                        silly_guard, Duration::from_millis(2000)).unwrap();
+                }
             }
         });
     }
 
     pub fn dump_metadata(&self) {
-        let g = self.tree.write().unwrap();
+        let g = self.tree.lock().unwrap();
         g.dump_metadata()
+    }
+
+    pub fn delete_unused_slab_files(&self) -> Result<(), io::Error> {
+        let g = self.tree.lock().unwrap();
+
+        let mut slab_names : HashSet<&str> = HashSet::new();
+        for slab in &g.slabs {
+            slab_names.insert(&slab.filename);
+        }
+
+        for f in fs::read_dir(&g.path)? {
+            let path = f?.path();
+            if !path.is_dir() && path.extension().map_or(false, |ext| ext == "sst") {
+                let name = path.file_name().unwrap().to_str().unwrap();
+                if !slab_names.contains(name) {
+                    fs::remove_file(&path)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
