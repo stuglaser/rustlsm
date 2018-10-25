@@ -1,4 +1,7 @@
-//#![allow(dead_code, unused)]
+/*
+Licensed under the MIT license
+Author: Stu Glaser
+*/
 
 extern crate byteorder;
 extern crate rand;
