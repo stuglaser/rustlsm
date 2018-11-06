@@ -363,16 +363,13 @@ impl LsmTreeInner {
         let target = self.get_target_slab(level_to_compact as usize);
 
         // Finds the SSTables to merge the target with
-        let overlaps : Vec<SlabInfo> = {
-            let mut overlaps : Vec<&SlabInfo> = self.slabs.iter()
-                .filter(|s|
-                        s.level == target.level + 1 &&
-                        target.overlaps(s))
-                .collect();
-            overlaps.sort_unstable_by_key(|s| &s.key_min);
-            let overlaps : Vec<SlabInfo> = overlaps.drain(..).map(|s| s.clone()).collect();
-            overlaps
-        };
+        let mut overlaps : Vec<&SlabInfo> = self.slabs.iter()
+            .filter(|s|
+                    s.level == target.level + 1 &&
+                    target.overlaps(s))
+            .collect();
+        overlaps.sort_unstable_by_key(|s| &s.key_min);
+        let overlaps : Vec<SlabInfo> = overlaps.drain(..).map(|s| s.clone()).collect();
 
         (target, overlaps)
     }
