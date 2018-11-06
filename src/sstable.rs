@@ -286,7 +286,7 @@ impl Iterator for SSTableChainer {
 
 #[cfg(test)]
 mod test {
-    use {SSTable, SSTableBuilder};
+    use crate::{SSTable, SSTableBuilder};
     use tempfile::NamedTempFile;
     use rand::{Rng, SeedableRng, IsaacRng, self};
 

@@ -24,13 +24,13 @@ use byteorder::*;
 use byteorder::LittleEndian as Endian;
 
 mod wal;
-use wal::{WalReader, WalWriter};
+use crate::wal::{WalReader, WalWriter};
 
 mod varstring;
-use varstring::{VarStringIORead, VarStringIOWrite};
+use crate::varstring::{VarStringIORead, VarStringIOWrite};
 
 pub mod sstable;
-use sstable::{SSTable, SSTableBuilder, SSTableChainer};
+use crate::sstable::{SSTable, SSTableBuilder, SSTableChainer};
 
 pub struct Options {
     /// Target size of an sstable in kb
@@ -407,7 +407,7 @@ impl LsmTreeInner {
         // .. doing bookkeeping in new_slabs
 
         loop {
-            use ::Which::*;
+            use crate::Which::*;
             let which = match (iter_target.peek(), iter_overlaps.peek()) {
                 (None, None) => Finished,
                 (Some(_), None) => TargetNext,
@@ -661,7 +661,7 @@ impl LsmTree {
 
 #[cfg(test)]
 mod tests {
-    use {LsmTree, Options, SSTable, SSTableBuilder};
+    use crate::{LsmTree, Options, SSTable, SSTableBuilder};
     use tempfile::{NamedTempFile, Builder as TempDirBuilder, TempDir};
     use std::io;
     use rand::{Rng, SeedableRng, IsaacRng, self};

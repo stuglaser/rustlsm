@@ -124,7 +124,7 @@ mod test {
 
     #[test]
     fn check_wal_works() {
-        use wal::{WalReader, WalWriter};
+        use crate::wal::{WalReader, WalWriter};
         use std::time::Duration;
         let tmp_dir = TempDirBuilder::new().prefix("rustlsm_test").tempdir().unwrap();
         {
